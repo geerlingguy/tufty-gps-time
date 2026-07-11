@@ -25,6 +25,8 @@ Once a GPS fix is established (I'm using an Adafruit Mini GPS PA1010D connected 
   - Add my name 'Jeff Geerling' just above the UTC time the same font size as local time
   - Add GPS info button on bottom right to show all GPS data (show like sats in view, fix status, any other neat and cool stuff Claude enjoys), with back button on bottom left from that screen to go back to main GPS clock display
   - If I plug in the GPS module while the app is running, it goes to 00:00:00Z and it seems like the whole thing locks up. Is it possible to hot-plug the GPS module while running?
+  - Add two info pages with GPS data.
+  - Add GPS sky view plot as 3rd info page.
 
 ## Fixes to be implemented
 

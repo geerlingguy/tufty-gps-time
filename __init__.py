@@ -10,18 +10,28 @@
 # Top-right  : battery gauge (level + charging indicator)
 # UTC clock  : orange instead of white while there's no GPS fix
 #
-# Three screens, paged with UP/DOWN (small arrow icons hint at direction):
-#   clock -> DOWN -> GPS info page 1 (fix status, sats, fix quality, HDOP, altitude)
-#   info1 -> DOWN -> GPS info page 2 (RTC sync, GGA/RMC seen, latitude, longitude)
+# Four screens, paged with UP/DOWN (small arrow icons hint at direction).
+# "info1/2/3" below are positions, not on-screen titles - the on-screen
+# titles are "Sky View", "GPS Info 1", and "GPS Info 2" respectively.
+#   clock -> DOWN -> info1: sky plot of satellites in view, from GSV ("Sky View")
+#   info1 -> DOWN -> info2: fix status, sats, fix quality, HDOP, altitude ("GPS Info 1")
+#   info2 -> DOWN -> info3: RTC sync, GGA/RMC seen, latitude, longitude ("GPS Info 2")
 #   info1 -> UP   -> clock
 #   info2 -> UP   -> info1
+#   info3 -> UP   -> info2
 #
-# GPS info page 1: fix status shown as NO FIX / 2D / 3D (from GSA mode2,
+# Sky View: centre = zenith, edge = horizon, azimuth clockwise from N at
+# top - a standard polar sky-view chart. Circles are GPS satellites,
+# triangles are other constellations (e.g. GLONASS). Green = used in the
+# current fix solution (from GSA), grey = visible but unused.
+#
+# GPS Info 1: fix status shown as NO FIX / 2D / 3D (from GSA mode2,
 # combined with the same fix-valid/timeout check as the top-left warning).
 # HDOP colour-coded green (<=2), orange (2-5), red (>5).
 
 import machine
 import time
+import math
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -97,6 +107,33 @@ gps_fix_type = 1              # GSA mode2: 1=no fix, 2=2D fix, 3=3D fix
 gps_lat = None                 # decimal degrees, +N/-S, from RMC
 gps_lon = None                 # decimal degrees, +E/-W, from RMC
 
+# Per-satellite sky-plot data, from GSV:
+# {(talker, prn): (elevation_deg, azimuth_deg, snr, last_seen_ticks)}.
+# talker is e.g. "GP" (GPS) or "GL" (GLONASS), kept alongside prn since PRN
+# numbering isn't guaranteed unique across constellations.
+#
+# Updated incrementally, one satellite at a time, as each GSV message is
+# parsed - not gated on a full multi-message cycle completing. An earlier
+# version waited for the last message in a cycle before committing
+# anything, on the theory that it'd avoid showing a half-updated list -
+# but a single dropped/corrupted sentence (routine on this I2C link, same
+# as the odd missed GGA/RMC) meant that satellite would vanish from the
+# plot for a whole second instead of just keeping its last known position.
+# Continuous merging plus the staleness prune in _update_fix_status()
+# (SAT_STALE_TIMEOUT) gives smoother, more honest behaviour: satellites
+# only disappear once they've actually been unreported for a while.
+gps_sats = {}
+
+# How long (seconds) a satellite can go unreported in GSV before we drop
+# it from gps_sats. Longer than GPS_FIX_TIMEOUT since a satellite briefly
+# missing one GSV cycle isn't the same signal as losing the fix entirely.
+SAT_STALE_TIMEOUT = 15
+
+# PRNs (numbers only, no talker - GSA doesn't repeat it per-satellite the
+# way GSV does) actually used in the current fix solution, from GSA fields
+# 3-14. Satellites in gps_sats but not in this set are visible but unused.
+gps_sats_used = set()
+
 # Ticks of the last time we processed *any* NMEA sentence, valid or not.
 # Distinct from gps_last_fix_ticks (which only updates on a successful RMC
 # fix) - this is how we tell "module unplugged, no data at all" apart from
@@ -112,7 +149,8 @@ _i2c_consecutive_errors = 0
 _i2c_last_recover_ticks = None
 _i2c_recover_count = 0
 
-# Which screen update() is currently drawing: "clock", "info1", or "info2".
+# Which screen update() is currently drawing: "clock", "info1", "info2",
+# or "info3".
 _screen = "clock"
 
 # Debug/diagnostic counters - shown on screen since Thonny's console won't
@@ -322,6 +360,7 @@ def _handle_nmea_sentence(line):
     global gps_num_sats, gps_fix_valid, gps_last_fix_ticks, gps_datetime
     global gga_count, rmc_count, gsa_count, last_nmea_line
     global gps_hdop, gps_altitude, gps_fix_quality, gps_fix_type, gps_lat, gps_lon
+    global gps_sats, gps_sats_used
     global _last_nmea_activity_ticks, _first_valid_fix_ticks
 
     last_nmea_line = line
@@ -367,6 +406,45 @@ def _handle_nmea_sentence(line):
                 gps_fix_type = int(fields[2])
             except ValueError:
                 pass
+
+        used = set()
+        for i in range(3, min(15, len(fields))):
+            if fields[i]:
+                try:
+                    used.add(int(fields[i]))
+                except ValueError:
+                    pass
+        if used:
+            gps_sats_used = used
+
+    elif sentence_id.endswith("GSV"):
+        # $--GSV,total_msgs,msg_num,total_sats,[prn,elev,az,snr]x1-4
+        # Talker (e.g. "GP"/"GL") tells apart satellites from different
+        # constellations that could otherwise share a PRN number.
+        talker = sentence_id[1:3]
+
+        if len(fields) < 4:
+            return
+
+        # Each group of 4 fields starting at index 4 is one satellite.
+        # The last message in a cycle is often padded with empty groups.
+        # Each satellite is merged straight into gps_sats as it's parsed -
+        # see the comment on gps_sats above for why this isn't gated on
+        # the whole multi-message cycle completing.
+        i = 4
+        while i + 3 < len(fields):
+            prn_str = fields[i]
+            if prn_str:
+                try:
+                    prn = int(prn_str)
+                    elevation = int(fields[i + 1]) if fields[i + 1] else None
+                    azimuth = int(fields[i + 2]) if fields[i + 2] else None
+                    snr = int(fields[i + 3]) if fields[i + 3] else None
+                    if elevation is not None and azimuth is not None:
+                        gps_sats[(talker, prn)] = (elevation, azimuth, snr, badge.ticks)
+                except ValueError:
+                    pass
+            i += 4
 
     elif sentence_id.endswith("RMC"):
         rmc_count += 1
@@ -481,6 +559,7 @@ def _poll_gps():
 def _update_fix_status():
     global gps_fix_valid
     global gps_num_sats, gps_hdop, gps_altitude, gps_fix_quality, gps_fix_type, gps_lat, gps_lon
+    global gps_sats, gps_sats_used
 
     if gps_fix_valid and gps_last_fix_ticks is not None:
         if (badge.ticks - gps_last_fix_ticks) > GPS_FIX_TIMEOUT * 1000:
@@ -506,6 +585,20 @@ def _update_fix_status():
         gps_fix_type = 1
         gps_lat = None
         gps_lon = None
+        gps_sats = {}
+        gps_sats_used = set()
+    else:
+        # Drop individual satellites that haven't shown up in a GSV
+        # message in a while (genuinely out of view now), separate from
+        # the module_silent wipe above - this runs even while the module
+        # is otherwise healthy and chatty.
+        now = badge.ticks
+        stale = [
+            key for key, (_e, _a, _s, last_seen) in gps_sats.items()
+            if (now - last_seen) > SAT_STALE_TIMEOUT * 1000
+        ]
+        for key in stale:
+            del gps_sats[key]
 
 
 def _sync_rtc_now():
@@ -629,15 +722,19 @@ def _get_display_datetime():
     return None
 
 
-# MTK NMEA output config: enable GGA + RMC + GSA, once per fix, and disable
-# GLL/VTG/GSV. The PA1010D sends sentences in a burst over its internal
-# UART (9600 baud by default) once per second, and RMC is normally near the
-# back of that burst - trimming it down to just the sentences we need means
-# RMC shows up much closer to the actual PPS edge instead of after several
-# extra sentences worth of transmission time. GSA is included (rather than
-# trimmed like GLL/VTG/GSV) because its mode2 field is the only thing that
-# tells us 2D vs 3D fix - GGA's fix-quality field doesn't carry that.
-_PMTK_SET_NMEA_OUTPUT_RMCGGAGSA = b"$PMTK314,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0*29\r\n"
+# MTK NMEA output config: enable GGA + RMC + GSA + GSV, once per fix, and
+# disable GLL/VTG. The PA1010D sends sentences in a burst over its internal
+# UART once per second, and trimming unused sentence types keeps that burst
+# shorter so RMC (and everything else) is available sooner after the true
+# GPS second. GSA is included because its mode2 field is the only thing
+# that tells us 2D vs 3D fix - GGA's fix-quality field doesn't carry that.
+# GSV is included (despite being the biggest addition to the burst, since
+# it needs one sentence per ~4 satellites in view) because it's the only
+# source of per-satellite elevation/azimuth/SNR - needed for the sky plot
+# on the third GPS info page. At 115200 baud the extra bytes cost single-
+# digit milliseconds, which is why this is affordable now when it wouldn't
+# have been worth it back at the original 9600 baud default.
+_PMTK_SET_NMEA_OUTPUT_RMCGGAGSAGSV = b"$PMTK314,0,1,0,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0*28\r\n"
 _PMTK_SET_NMEA_UPDATE_1HZ = b"$PMTK220,1000*1F\r\n"
 
 # Raise the module's internal NMEA generation rate from the 9600 baud
@@ -669,7 +766,7 @@ def _configure_gps():
     if _i2c is None:
         return
     try:
-        _i2c.writeto(GPS_I2C_ADDR, _PMTK_SET_NMEA_OUTPUT_RMCGGAGSA)
+        _i2c.writeto(GPS_I2C_ADDR, _PMTK_SET_NMEA_OUTPUT_RMCGGAGSAGSV)
     except OSError as e:
         print("gps_time: PMTK314 write failed:", e)
     try:
@@ -709,6 +806,10 @@ def init():
 
 _ARROW_W = 10
 _ARROW_H = 7
+
+# Deliberately small and fixed rather than filling available screen space -
+# see the comment in _draw_info_screen_1() for why.
+SKY_PLOT_MAX_RADIUS = 44
 
 
 def _draw_down_arrow(cx, cy):
@@ -838,11 +939,11 @@ def _draw_clock_screen():
         screen.text(line2, 4, screen.height - lh - 3)
 
 
-def _draw_info_page(title, lines, show_down_arrow):
-    """Shared renderer for both GPS info pages. `lines` is a list of
-    (label, value, value_color) tuples. `show_down_arrow` controls whether
-    a down arrow (more info below) is drawn in the bottom-right corner -
-    the last page only shows the up arrow, since there's nowhere left to go."""
+def _draw_info_header(title, show_down_arrow):
+    """Shared header for GPS info pages: title, battery, up arrow (every
+    info page can page back up), and an optional down arrow for pages that
+    have another one below them. Returns the y-coordinate below the header
+    where page-specific content can start."""
     screen.pen = color.black
     screen.clear()
 
@@ -860,10 +961,17 @@ def _draw_info_page(title, lines, show_down_arrow):
     if show_down_arrow:
         _draw_down_arrow(screen.width - 12, screen.height - 10)
 
+    return 4 + _BATTERY_H + 2 + _ARROW_H + 4
+
+
+def _draw_info_page(title, lines, show_down_arrow):
+    """Shared renderer for label/value GPS info pages. `lines` is a list of
+    (label, value, value_color) tuples."""
+    start_y = _draw_info_header(title, show_down_arrow)
+
     screen.font = _debug_font
     _, sample_h = screen.measure_text("Ay")
     row_h = int(sample_h) + 4
-    start_y = 4 + _BATTERY_H + 2 + _ARROW_H + 4
     right_margin = 6
 
     for i, (label, value, value_color) in enumerate(lines):
@@ -878,8 +986,8 @@ def _draw_info_page(title, lines, show_down_arrow):
         screen.text(value, screen.width - int(vw) - right_margin, row_y)
 
 
-def _draw_info_screen_1():
-    """GPS info, page 1: the fix itself."""
+def _draw_info_screen_2():
+    """GPS info, page 2 ("GPS Info 1" on screen): the fix itself."""
     fix_quality_names = {0: "none", 1: "GPS", 2: "DGPS"}
     fix_quality_str = fix_quality_names.get(gps_fix_quality, str(gps_fix_quality))
 
@@ -917,11 +1025,11 @@ def _draw_info_screen_1():
         ("Altitude", "{:.1f} m".format(gps_altitude) if gps_altitude is not None else "--", None),
     ]
 
-    _draw_info_page("GPS Info", lines, show_down_arrow=True)
+    _draw_info_page("GPS Info 1", lines, show_down_arrow=True)
 
 
-def _draw_info_screen_2():
-    """GPS info, page 2: position + sync detail."""
+def _draw_info_screen_3():
+    """GPS info, page 3 ("GPS Info 2" on screen, last): position + sync detail."""
     if gps_last_sync_ticks is not None:
         sync_age_s = (badge.ticks - gps_last_sync_ticks) / 1000
         rtc_sync_str = "{:.0f}s ago".format(sync_age_s)
@@ -936,6 +1044,146 @@ def _draw_info_screen_2():
     ]
 
     _draw_info_page("GPS Info 2", lines, show_down_arrow=False)
+
+
+def _draw_sky_plot(cx, cy, radius):
+    """Polar sky plot: centre = zenith (elevation 90), edge = horizon
+    (elevation 0), azimuth measured clockwise from N at the top - same
+    convention as a standard GPS sky-view chart."""
+
+    # Reference rings at elevation 60/30/0, using the same double-circle
+    # outline trick as the battery icon: draw the ring colour, then a
+    # slightly smaller circle in the background colour on top to hollow
+    # out the middle rather than leaving a filled disc.
+    for elevation in (60, 30, 0):
+        r = int(radius * (90 - elevation) / 90)
+        if r <= 0:
+            continue
+        screen.pen = color.smoke
+        screen.circle(cx, cy, r)
+        screen.pen = color.black
+        screen.circle(cx, cy, max(0, r - 1))
+
+    # Cardinal direction labels around the horizon ring.
+    screen.font = _debug_font
+    screen.pen = color.smoke
+    for label, az in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
+        rad = math.radians(az)
+        tx = cx + (radius + 8) * math.sin(rad)
+        ty = cy - (radius + 8) * math.cos(rad)
+        tw, th = screen.measure_text(label)
+        screen.text(label, int(tx - tw / 2), int(ty - th / 2))
+
+    # Satellites: circles for GPS ("GP"), triangles for anything else
+    # (e.g. GLONASS "GL") - mirrors the circle-vs-triangle convention from
+    # typical sky-plot tools. Green if used in the current fix solution,
+    # dim grey if just visible but not used.
+    for (talker, prn), (elevation, azimuth, _snr, _last_seen) in gps_sats.items():
+        r = radius * (90 - elevation) / 90
+        rad = math.radians(azimuth)
+        x = cx + r * math.sin(rad)
+        y = cy - r * math.cos(rad)
+
+        screen.pen = color.green if prn in gps_sats_used else color.smoke
+
+        if talker == "GP":
+            screen.circle(int(x), int(y), 3)
+        else:
+            screen.triangle(x - 3, y + 3, x + 3, y + 3, x, y - 3)
+
+
+_LEGEND_MARKER_R = 3  # matches the satellite marker size in the plot itself
+
+
+def _draw_sky_plot_legend(x, y, row_h):
+    """Small legend explaining the sky plot's two independent visual
+    dimensions: colour (used in fix vs. just visible) and shape
+    (constellation). Short labels on purpose - there's only ever half the
+    screen width to work with here, and this display's actual usable
+    width has surprised us before, so labels stay short rather than
+    relying on there being room."""
+    screen.font = _debug_font
+
+    entries = [
+        (color.green, "circle", "Used"),
+        (color.smoke, "circle", "Visible"),
+        (color.white, "circle", "GPS"),
+        (color.white, "triangle", "Other"),
+    ]
+
+    for i, (marker_color, shape_kind, label) in enumerate(entries):
+        row_y = y + i * row_h
+        marker_cx = x + _LEGEND_MARKER_R
+        marker_cy = row_y + _LEGEND_MARKER_R
+
+        screen.pen = marker_color
+        if shape_kind == "circle":
+            screen.circle(marker_cx, marker_cy, _LEGEND_MARKER_R)
+        else:
+            screen.triangle(
+                marker_cx - _LEGEND_MARKER_R, marker_cy + _LEGEND_MARKER_R,
+                marker_cx + _LEGEND_MARKER_R, marker_cy + _LEGEND_MARKER_R,
+                marker_cx, marker_cy - _LEGEND_MARKER_R,
+            )
+
+        screen.pen = color.smoke
+        _, th = screen.measure_text(label)
+        screen.text(label, x + _LEGEND_MARKER_R * 2 + 4, int(row_y + _LEGEND_MARKER_R - th / 2))
+
+
+_SKY_PLOT_LEGEND_LABELS = ["Used", "Visible", "GPS", "Other"]
+
+
+def _draw_info_screen_1():
+    """GPS info, page 1 (first, "Sky View" on screen): sky plot of
+    satellites currently in view (left), with a legend (right) explaining
+    the marker colours/shapes."""
+    start_y = _draw_info_header("Sky View", show_down_arrow=True)
+
+    available_h = screen.height - start_y - 4
+
+    # Measure the legend's actual width first and anchor it to the real
+    # right edge of the screen, rather than assuming a layout and hoping
+    # the legend fits after - this display's real width has been wrong
+    # more than once already (see the info-page column fix, the sky plot
+    # radius fix). Only once we know how much room the legend genuinely
+    # needs do we size the plot with whatever's left.
+    screen.font = _debug_font
+    legend_max_label_w = max(int(screen.measure_text(t)[0]) for t in _SKY_PLOT_LEGEND_LABELS)
+    legend_gap = 4
+    legend_w = _LEGEND_MARKER_R * 2 + legend_gap + legend_max_label_w
+    right_margin = 4
+    plot_to_legend_gap = 8
+
+    # Deliberately conservative rather than trying to fill available
+    # space: SKY_PLOT_MAX_RADIUS is a small, fixed cap, and the fit-to-
+    # screen numbers below can only ever shrink it further, never grow it
+    # past that cap. Reserve an extra 14px beyond the ring itself for the
+    # N/E/S/W labels drawn just outside it.
+    label_margin = 14
+    plot_budget_w = screen.width - legend_w - right_margin - plot_to_legend_gap
+    fits_width = (plot_budget_w - 2 * label_margin) // 2
+    fits_height = (available_h - 2 * label_margin) // 2
+    radius = min(SKY_PLOT_MAX_RADIUS, fits_width, fits_height)
+    radius = max(10, radius)
+
+    plot_footprint = radius + label_margin
+    cx = plot_footprint + 6
+    cy = start_y + available_h // 2
+
+    _draw_sky_plot(cx, cy, radius)
+
+    legend_x = screen.width - legend_w - right_margin
+    _, sample_h = screen.measure_text("Ay")
+    legend_row_h = int(sample_h) + 4
+    _draw_sky_plot_legend(legend_x, start_y + 4, legend_row_h)
+
+    if not gps_sats:
+        screen.font = _debug_font
+        screen.pen = color.smoke
+        msg = "no data yet"
+        mw, mh = screen.measure_text(msg)
+        screen.text(msg, int(cx - mw / 2), int(cy - mh / 2))
 
 
 def update():
@@ -958,11 +1206,19 @@ def update():
             _screen = "clock"
             return
         _draw_info_screen_1()
-    else:  # "info2"
+    elif _screen == "info2":
+        if badge.pressed(BUTTON_DOWN):
+            _screen = "info3"
+            return
         if badge.pressed(BUTTON_UP):
             _screen = "info1"
             return
         _draw_info_screen_2()
+    else:  # "info3"
+        if badge.pressed(BUTTON_UP):
+            _screen = "info2"
+            return
+        _draw_info_screen_3()
 
 
 # Call this explicitly rather than relying solely on the app loader to find
