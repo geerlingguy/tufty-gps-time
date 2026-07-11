@@ -36,10 +36,10 @@ OWNER_NAME = "Jeff Geerling"
 
 # How often (in seconds) to push GPS time into the RTC once we have a fix.
 # Frequent enough that RTC crystal drift between syncs stays negligible
-# (well under a millisecond even for a mediocre ~20-50ppm crystal over 1
-# minute, vs. up to ~180ms/hour if left the old default of once an hour),
-# without writing to the RTC constantly.
-RTC_SYNC_INTERVAL = 60  # once every minute
+# (a few ms even for a mediocre ~20-50ppm crystal over 5 minutes, vs. up to
+# ~180ms/hour if left the old default of once an hour), without writing to
+# the RTC constantly.
+RTC_SYNC_INTERVAL = 300  # once every 5 minutes
 
 # How long (seconds) to wait after first acquiring a fix before trusting it
 # enough for the *first* RTC sync of this session. A freshly-acquired fix
@@ -229,6 +229,20 @@ def _format_12h(hour, minute, second):
     if h12 == 0:
         h12 = 12
     return "{:d}:{:02d}:{:02d} {}".format(h12, minute, second, period)
+
+
+def _format_compact_count(n):
+    """Abbreviates large counters so they don't run off the info screen:
+    1244 -> '1.2K', 3456789 -> '3.5M'. Anything under 1000 is shown as-is."""
+    if n < 1000:
+        return str(n)
+    if n < 1000000:
+        text = "{:.1f}K".format(n / 1000)
+        # n like 999,600 rounds to "1000.0K" rather than rolling over to M.
+        if text == "1000.0K":
+            return "1.0M"
+        return text
+    return "{:.1f}M".format(n / 1000000)
 
 
 # ---------------------------------------------------------------------------
@@ -812,7 +826,11 @@ def _draw_clock_screen():
         line1 = "i2c:{} rtc:{} b:{} e:{}".format(
             i2c_scan_result, "T" if rtc_available else "F", i2c_bytes_read, i2c_read_errors
         )
-        line2 = "ln:{} gga:{} rmc:{}".format(nmea_lines_seen, gga_count, rmc_count)
+        line2 = "ln:{} gga:{} rmc:{}".format(
+            _format_compact_count(nmea_lines_seen),
+            _format_compact_count(gga_count),
+            _format_compact_count(rmc_count),
+        )
 
         _, lh = screen.measure_text(line1)
         lh = int(lh)
@@ -912,7 +930,7 @@ def _draw_info_screen_2():
 
     lines = [
         ("RTC SYNC", rtc_sync_str, None),
-        ("GGA / RMC seen", "{} / {}".format(gga_count, rmc_count), None),
+        ("GGA / RMC seen", "{} / {}".format(_format_compact_count(gga_count), _format_compact_count(rmc_count)), None),
         ("Latitude", "{:.5f}".format(gps_lat) if gps_lat is not None else "--", None),
         ("Longitude", "{:.5f}".format(gps_lon) if gps_lon is not None else "--", None),
     ]
