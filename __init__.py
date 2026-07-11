@@ -1,15 +1,24 @@
 # gps_time - GPS-synced clock for Badgeware (Tufty 2350)
 #
-# Shows UTC (large, ISO-style with trailing "Z") + local time below it,
+# Shows UTC (large, ISO-style with trailing "Z") and local time below it,
 # sourced from the internal RTC (kept accurate by periodic syncs from an
-# Adafruit PA1010D GPS module over QWIIC/I2C).
+# Adafruit PA1010D GPS module over QWIIC/I2C). Owner name is shown just
+# above the UTC clock, same size/style as the local time line.
 #
 # Top-left   : "NO FIX" (red) until the GPS has a valid time fix
 # Top-middle : "N sats" - red @ 0, orange @ 1-4, green @ 5+
 # Top-right  : battery gauge (level + charging indicator)
 # UTC clock  : orange instead of white while there's no GPS fix
-# Button DOWN: page down to a GPS detail screen (sats/HDOP/altitude/etc.)
-# Button UP  : page back up to the main clock from the detail screen
+#
+# Three screens, paged with UP/DOWN (small arrow icons hint at direction):
+#   clock -> DOWN -> GPS info page 1 (fix status, sats, fix quality, HDOP, altitude)
+#   info1 -> DOWN -> GPS info page 2 (RTC sync, GGA/RMC seen, latitude, longitude)
+#   info1 -> UP   -> clock
+#   info2 -> UP   -> info1
+#
+# GPS info page 1: fix status shown as NO FIX / 2D / 3D (from GSA mode2,
+# combined with the same fix-valid/timeout check as the top-left warning).
+# HDOP colour-coded green (<=2), orange (2-5), red (>5).
 
 import machine
 import time
@@ -26,7 +35,18 @@ LOCAL_OFFSET = -5
 OWNER_NAME = "Jeff Geerling"
 
 # How often (in seconds) to push GPS time into the RTC once we have a fix.
-RTC_SYNC_INTERVAL = 3600  # once per hour
+# Frequent enough that RTC crystal drift between syncs stays negligible
+# (well under a millisecond even for a mediocre ~20-50ppm crystal over 1
+# minute, vs. up to ~180ms/hour if left the old default of once an hour),
+# without writing to the RTC constantly.
+RTC_SYNC_INTERVAL = 60  # once every minute
+
+# How long (seconds) to wait after first acquiring a fix before trusting it
+# enough for the *first* RTC sync of this session. A freshly-acquired fix
+# can still be settling (time/position solution refining as more satellites
+# lock in) - this avoids syncing the RTC to that transient. Only applies to
+# the first sync; every sync after that follows RTC_SYNC_INTERVAL normally.
+FIRST_SYNC_DELAY = 20
 
 # How long (seconds) we'll keep showing a fix as "valid" after the last
 # good RMC sentence before falling back to "NO FIX".
@@ -73,12 +93,26 @@ gps_last_sync_ticks = None
 gps_hdop = None               # horizontal dilution of precision, from GGA
 gps_altitude = None           # metres above sea level, from GGA
 gps_fix_quality = 0           # GGA fix quality: 0=none, 1=GPS, 2=DGPS, ...
+gps_fix_type = 1              # GSA mode2: 1=no fix, 2=2D fix, 3=3D fix
+gps_lat = None                 # decimal degrees, +N/-S, from RMC
+gps_lon = None                 # decimal degrees, +E/-W, from RMC
+
+# Ticks of the last time we processed *any* NMEA sentence, valid or not.
+# Distinct from gps_last_fix_ticks (which only updates on a successful RMC
+# fix) - this is how we tell "module unplugged, no data at all" apart from
+# "module present but still searching for a fix".
+_last_nmea_activity_ticks = None
+
+# Ticks of the first time we ever saw a valid RMC fix this session. Used
+# only to gate the first RTC sync behind FIRST_SYNC_DELAY - never reset,
+# even if the fix is later lost and reacquired.
+_first_valid_fix_ticks = None
 
 _i2c_consecutive_errors = 0
 _i2c_last_recover_ticks = None
 _i2c_recover_count = 0
 
-# Which screen update() is currently drawing: "clock" or "info".
+# Which screen update() is currently drawing: "clock", "info1", or "info2".
 _screen = "clock"
 
 # Debug/diagnostic counters - shown on screen since Thonny's console won't
@@ -91,6 +125,7 @@ i2c_bytes_read = 0
 nmea_lines_seen = 0          # any line starting with '$', valid or not
 gga_count = 0
 rmc_count = 0
+gsa_count = 0
 last_nmea_line = ""
 
 _time_font = rom_font.ignore      # 17px, colossal - the biggest built-in pixel font
@@ -231,7 +266,7 @@ def _draw_battery_icon(x, y):
     screen.shape(shape.rectangle(pos[0] + size[0], pos[1] + 2, _BATTERY_NUB_W, 4))
 
     # hollow out the middle back to the background colour, leaving an outline
-    screen.pen = color.navy
+    screen.pen = color.black
     screen.shape(shape.rectangle(pos[0] + 1, pos[1] + 1, size[0] - 2, size[1] - 2))
 
     # fill level
@@ -246,12 +281,37 @@ def _draw_battery_icon(x, y):
 # GPS / NMEA handling
 # ---------------------------------------------------------------------------
 
+def _parse_nmea_coord(value_str, hemisphere):
+    """Converts an NMEA ddmm.mmmm / dddmm.mmmm coordinate field plus its
+    hemisphere letter (N/S/E/W) into signed decimal degrees. Works for both
+    latitude (2-digit degrees) and longitude (3-digit degrees) - dividing by
+    100 always splits off the last two digits as minutes regardless of how
+    many degree digits come before them."""
+    if not value_str or not hemisphere:
+        return None
+    try:
+        raw = float(value_str)
+    except ValueError:
+        return None
+
+    degrees = int(raw / 100)
+    minutes = raw - degrees * 100
+    decimal = degrees + minutes / 60
+
+    if hemisphere in ("S", "W"):
+        decimal = -decimal
+
+    return decimal
+
+
 def _handle_nmea_sentence(line):
     global gps_num_sats, gps_fix_valid, gps_last_fix_ticks, gps_datetime
-    global gga_count, rmc_count, last_nmea_line
-    global gps_hdop, gps_altitude, gps_fix_quality
+    global gga_count, rmc_count, gsa_count, last_nmea_line
+    global gps_hdop, gps_altitude, gps_fix_quality, gps_fix_type, gps_lat, gps_lon
+    global _last_nmea_activity_ticks, _first_valid_fix_ticks
 
     last_nmea_line = line
+    _last_nmea_activity_ticks = badge.ticks
 
     body = line.split("*")[0]
     fields = body.split(",")
@@ -284,6 +344,16 @@ def _handle_nmea_sentence(line):
             except ValueError:
                 pass
 
+    elif sentence_id.endswith("GSA"):
+        gsa_count += 1
+        # $--GSA,mode1,mode2,sat1..sat12,PDOP,HDOP,VDOP
+        # mode2: 1=no fix, 2=2D fix, 3=3D fix
+        if len(fields) > 2 and fields[2]:
+            try:
+                gps_fix_type = int(fields[2])
+            except ValueError:
+                pass
+
     elif sentence_id.endswith("RMC"):
         rmc_count += 1
         # $--RMC,time,status,lat,NS,lon,EW,speed,course,date,...
@@ -302,11 +372,24 @@ def _handle_nmea_sentence(line):
                 month = int(date_str[2:4])
                 year = 2000 + int(date_str[4:6])
 
-                dow = _day_of_week(year, month, day)
+                candidate = (year, month, day, hour, minute, second)
 
-                gps_datetime = (year, month, day, hour, minute, second, dow)
-                gps_fix_valid = True
-                gps_last_fix_ticks = badge.ticks
+                # A corrupted read during a bus glitch (e.g. hot-plugging
+                # the module) can still parse as structurally valid digits
+                # while being nonsense - don't let that update the clock.
+                if _is_plausible_datetime(candidate):
+                    dow = _day_of_week(year, month, day)
+
+                    gps_datetime = (year, month, day, hour, minute, second, dow)
+                    gps_fix_valid = True
+                    gps_last_fix_ticks = badge.ticks
+
+                    if _first_valid_fix_ticks is None:
+                        _first_valid_fix_ticks = badge.ticks
+
+                    if len(fields) > 6:
+                        gps_lat = _parse_nmea_coord(fields[3], fields[4])
+                        gps_lon = _parse_nmea_coord(fields[5], fields[6])
             except ValueError:
                 pass
 
@@ -319,13 +402,15 @@ def _poll_gps():
         return
 
     # Drain everything currently waiting instead of reading one fixed-size
-    # chunk. The module streams continuously (~960 bytes/sec at 9600 baud)
-    # regardless of how often we poll - if update() runs slower than that
-    # (e.g. because rendering the scaled clock takes a while), reading only
-    # one 32-byte chunk per frame falls further behind every second,
-    # showing up as a growing display lag rather than a fixed latency.
-    # Stop once a chunk comes back as all filler (nothing left to read) or
-    # we hit the cap, so we don't spend forever draining on a bad frame.
+    # chunk. The module streams continuously (now ~11.5KB/sec at the
+    # 115200 baud we configure it for in _configure_gps(), up from 9600
+    # default) regardless of how often we poll - if update() runs slower
+    # than that (e.g. because rendering the scaled clock takes a while),
+    # reading only one 32-byte chunk per frame falls further behind every
+    # second, showing up as a growing display lag rather than a fixed
+    # latency. Stop once a chunk comes back as all filler (nothing left to
+    # read) or we hit the cap, so we don't spend forever draining on a bad
+    # frame.
     for _ in range(_I2C_MAX_READS_PER_POLL):
         try:
             chunk = _i2c.readfrom(GPS_I2C_ADDR, 32)
@@ -381,9 +466,32 @@ def _poll_gps():
 
 def _update_fix_status():
     global gps_fix_valid
+    global gps_num_sats, gps_hdop, gps_altitude, gps_fix_quality, gps_fix_type, gps_lat, gps_lon
+
     if gps_fix_valid and gps_last_fix_ticks is not None:
         if (badge.ticks - gps_last_fix_ticks) > GPS_FIX_TIMEOUT * 1000:
             gps_fix_valid = False
+
+    # If we haven't processed *any* NMEA sentence in a while (e.g. the
+    # module was unplugged), the satellite count/HDOP/altitude/position we
+    # last saw are stale, not current - reset them rather than leaving old
+    # numbers on screen forever. This is deliberately separate from the
+    # gps_fix_valid check above, which only tracks RMC-based time fixes:
+    # a module that's still present but hasn't resolved a fix yet keeps
+    # sending GGA with a live (possibly climbing) satellite count, and we
+    # don't want to zero that out just because RMC hasn't gone valid yet.
+    module_silent = (
+        _last_nmea_activity_ticks is None or
+        (badge.ticks - _last_nmea_activity_ticks) > GPS_FIX_TIMEOUT * 1000
+    )
+    if module_silent:
+        gps_num_sats = 0
+        gps_hdop = None
+        gps_altitude = None
+        gps_fix_quality = 0
+        gps_fix_type = 1
+        gps_lat = None
+        gps_lon = None
 
 
 def _sync_rtc_now():
@@ -407,7 +515,16 @@ def _maybe_sync_rtc():
         return
 
     now = badge.ticks
-    if gps_last_sync_ticks is None or (now - gps_last_sync_ticks) >= RTC_SYNC_INTERVAL * 1000:
+
+    if gps_last_sync_ticks is None:
+        # First sync of this session: let the fix settle for a bit rather
+        # than trusting it the instant it appears.
+        if _first_valid_fix_ticks is None or (now - _first_valid_fix_ticks) < FIRST_SYNC_DELAY * 1000:
+            return
+        _sync_rtc_now()
+        return
+
+    if (now - gps_last_sync_ticks) >= RTC_SYNC_INTERVAL * 1000:
         _sync_rtc_now()
 
 
@@ -458,38 +575,97 @@ def _i2c_recover():
         print("gps_time: i2c reinit after recovery failed:", e)
 
 
+def _is_plausible_datetime(dt):
+    """Sanity-checks a (year, month, day, hour, minute, second, dow) tuple.
+    Guards against displaying a bogus-but-plausible-looking timestamp (like
+    midnight on 0000-00-00) if an I2C glitch - e.g. from hot-plugging the
+    GPS module - causes a read to come back as all zeros, or otherwise out
+    of range, instead of raising a clean exception."""
+    if dt is None:
+        return False
+    try:
+        year, month, day, hour, minute, second = dt[0], dt[1], dt[2], dt[3], dt[4], dt[5]
+    except (TypeError, IndexError):
+        return False
+
+    return (
+        2024 <= year <= 2100 and
+        1 <= month <= 12 and
+        1 <= day <= 31 and
+        0 <= hour <= 23 and
+        0 <= minute <= 59 and
+        0 <= second <= 59
+    )
+
+
 def _get_display_datetime():
     """Time source for the clock display: prefer the RTC (kept accurate by
     GPS syncs), fall back to the last known GPS time if there's no RTC."""
     if rtc_available:
         try:
-            return rtc.datetime()
+            dt = rtc.datetime()
+            if _is_plausible_datetime(dt):
+                return dt
         except Exception:
             pass
-    return gps_datetime
+
+    if _is_plausible_datetime(gps_datetime):
+        return gps_datetime
+
+    return None
 
 
-# MTK NMEA output config: enable only GGA + RMC, once per fix, and disable
-# GLL/VTG/GSA/GSV. The PA1010D sends sentences in a burst over its internal
+# MTK NMEA output config: enable GGA + RMC + GSA, once per fix, and disable
+# GLL/VTG/GSV. The PA1010D sends sentences in a burst over its internal
 # UART (9600 baud by default) once per second, and RMC is normally near the
-# back of that burst - trimming it down to just the two sentences we need
-# means RMC shows up much closer to the actual PPS edge instead of after
-# several extra sentences worth of transmission time.
-_PMTK_SET_NMEA_OUTPUT_RMCGGA = b"$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28\r\n"
+# back of that burst - trimming it down to just the sentences we need means
+# RMC shows up much closer to the actual PPS edge instead of after several
+# extra sentences worth of transmission time. GSA is included (rather than
+# trimmed like GLL/VTG/GSV) because its mode2 field is the only thing that
+# tells us 2D vs 3D fix - GGA's fix-quality field doesn't carry that.
+_PMTK_SET_NMEA_OUTPUT_RMCGGAGSA = b"$PMTK314,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0*29\r\n"
 _PMTK_SET_NMEA_UPDATE_1HZ = b"$PMTK220,1000*1F\r\n"
+
+# Raise the module's internal NMEA generation rate from the 9600 baud
+# default to 115200. Even though we talk to it over I2C, not a physical
+# UART, the I2C interface is a bridge over that same internal generation -
+# I2C reads just drain whatever's in the buffer, filler bytes and all (see
+# _poll_gps()). A slower internal baud means the once-a-second GGA+RMC+GSA
+# burst takes measurably longer to finish being generated (~145ms at 9600
+# baud for our ~140-byte burst, vs ~12ms at 115200) - all of which is
+# latency between the true GPS second and RMC actually being parseable.
+# This doesn't touch I2C_FREQ (the physical I2C clock, already far faster
+# than either baud) or the 1Hz fix rate above - only how fast each burst
+# is assembled internally.
+#
+# Sent last, after the sentence-selection and update-rate commands: since
+# I2C writes aren't baud-gated the way physical UART commands would be,
+# ordering doesn't matter functionally, but doing the "most disruptive"
+# change last keeps the other two commands' effect unambiguous if this one
+# turns out not to be honoured in I2C-bridge mode (unconfirmed against
+# GlobalTop's own docs, which only cover the UART use case - if this
+# doesn't help, it should still be harmless to leave in). If you ever need
+# to walk it back, resend this same command with 9600 in place of 115200 -
+# recovery doesn't depend on guessing the current baud, since I2C traffic
+# itself was never baud-limited.
+_PMTK_SET_BAUD_115200 = b"$PMTK251,115200*1F\r\n"
 
 
 def _configure_gps():
     if _i2c is None:
         return
     try:
-        _i2c.writeto(GPS_I2C_ADDR, _PMTK_SET_NMEA_OUTPUT_RMCGGA)
+        _i2c.writeto(GPS_I2C_ADDR, _PMTK_SET_NMEA_OUTPUT_RMCGGAGSA)
     except OSError as e:
         print("gps_time: PMTK314 write failed:", e)
     try:
         _i2c.writeto(GPS_I2C_ADDR, _PMTK_SET_NMEA_UPDATE_1HZ)
     except OSError as e:
         print("gps_time: PMTK220 write failed:", e)
+    try:
+        _i2c.writeto(GPS_I2C_ADDR, _PMTK_SET_BAUD_115200)
+    except OSError as e:
+        print("gps_time: PMTK251 write failed:", e)
 
 
 # ---------------------------------------------------------------------------
@@ -517,19 +693,28 @@ def init():
     print("gps_time: rtc available:", rtc_available)
 
 
-def _draw_hint(label):
-    """Small centered hint line along the bottom edge, e.g. which button
-    to press to change screens."""
-    screen.font = _label_font
+_ARROW_W = 10
+_ARROW_H = 7
+
+
+def _draw_down_arrow(cx, cy):
+    """Small filled down-pointing triangle centred at (cx, cy)."""
     screen.pen = color.rgb(255, 255, 255, LOCAL_ALPHA)
-    w, h = screen.measure_text(label)
-    w = int(w)
-    h = int(h)
-    screen.text(label, int((screen.width - w) / 2), screen.height - h - 3)
+    hw = _ARROW_W / 2
+    hh = _ARROW_H / 2
+    screen.triangle(cx - hw, cy - hh, cx + hw, cy - hh, cx, cy + hh)
+
+
+def _draw_up_arrow(cx, cy):
+    """Small filled up-pointing triangle centred at (cx, cy)."""
+    screen.pen = color.rgb(255, 255, 255, LOCAL_ALPHA)
+    hw = _ARROW_W / 2
+    hh = _ARROW_H / 2
+    screen.triangle(cx - hw, cy + hh, cx + hw, cy + hh, cx, cy - hh)
 
 
 def _draw_clock_screen():
-    screen.pen = color.navy
+    screen.pen = color.black
     screen.clear()
 
     dt = _get_display_datetime()
@@ -559,7 +744,7 @@ def _draw_clock_screen():
         _utc_buf = image(tw, th)
         _utc_buf_size = (tw, th)
 
-    _utc_buf.pen = color.navy
+    _utc_buf.pen = color.black
     _utc_buf.clear()
     _utc_buf.pen = utc_color
     _utc_buf.font = _time_font
@@ -616,7 +801,8 @@ def _draw_clock_screen():
     _draw_battery_icon(screen.width - _BATTERY_W - _BATTERY_NUB_W - 4, 4)
 
     # -- bottom hint: press DOWN for the GPS info page --
-    _draw_hint("DOWN for GPS info")
+    # -- bottom-right: down arrow hints at the GPS info page below --
+    _draw_down_arrow(screen.width - 12, screen.height - 10)
 
     # -- debug overlay --
     if DEBUG_OVERLAY:
@@ -634,26 +820,90 @@ def _draw_clock_screen():
         screen.text(line2, 4, screen.height - lh - 3)
 
 
-def _draw_info_screen():
-    """Second page, showing everything we currently know from the GPS."""
-    screen.pen = color.navy
+def _draw_info_page(title, lines, show_down_arrow):
+    """Shared renderer for both GPS info pages. `lines` is a list of
+    (label, value, value_color) tuples. `show_down_arrow` controls whether
+    a down arrow (more info below) is drawn in the bottom-right corner -
+    the last page only shows the up arrow, since there's nowhere left to go."""
+    screen.pen = color.black
     screen.clear()
 
     screen.font = _label_font
     screen.pen = color.white
-    screen.text("GPS Info", 4, 4)
+    screen.text(title, 4, 4)
 
-    _draw_battery_icon(screen.width - _BATTERY_W - _BATTERY_NUB_W - 4, 4)
+    battery_x = screen.width - _BATTERY_W - _BATTERY_NUB_W - 4
+    _draw_battery_icon(battery_x, 4)
 
+    # up arrow, centred under the battery icon, hints at paging back up
+    battery_center_x = battery_x + (_BATTERY_W + _BATTERY_NUB_W) / 2
+    _draw_up_arrow(battery_center_x, 4 + _BATTERY_H + 2 + _ARROW_H / 2)
+
+    if show_down_arrow:
+        _draw_down_arrow(screen.width - 12, screen.height - 10)
+
+    screen.font = _debug_font
+    _, sample_h = screen.measure_text("Ay")
+    row_h = int(sample_h) + 4
+    start_y = 4 + _BATTERY_H + 2 + _ARROW_H + 4
+    right_margin = 6
+
+    for i, (label, value, value_color) in enumerate(lines):
+        row_y = start_y + i * row_h
+        screen.pen = color.smoke
+        screen.text(label, 6, row_y)
+
+        # Right-align the value so it never runs off the edge of the
+        # screen, regardless of display resolution.
+        screen.pen = value_color if value_color is not None else color.white
+        vw, _vh = screen.measure_text(value)
+        screen.text(value, screen.width - int(vw) - right_margin, row_y)
+
+
+def _draw_info_screen_1():
+    """GPS info, page 1: the fix itself."""
     fix_quality_names = {0: "none", 1: "GPS", 2: "DGPS"}
     fix_quality_str = fix_quality_names.get(gps_fix_quality, str(gps_fix_quality))
 
-    if gps_last_fix_ticks is not None:
-        fix_age_s = (badge.ticks - gps_last_fix_ticks) / 1000
-        fix_age_str = "{:.1f}s ago".format(fix_age_s)
+    # gps_fix_valid tracks whether we have a recent, usable time fix (from
+    # RMC); gps_fix_type is the GSA dimensionality (2D/3D) of that fix. A
+    # stale/lost fix always shows as NO FIX regardless of the last-known
+    # GSA mode, since gps_fix_valid already accounts for GPS_FIX_TIMEOUT.
+    if not gps_fix_valid or gps_fix_type <= 1:
+        fix_status_str = "NO FIX"
+        fix_status_color = color.red
+    elif gps_fix_type == 2:
+        fix_status_str = "2D"
+        fix_status_color = color.orange
     else:
-        fix_age_str = "never"
+        fix_status_str = "3D"
+        fix_status_color = color.green
 
+    if gps_hdop is None:
+        hdop_str = "--"
+        hdop_color = None
+    else:
+        hdop_str = "{:.1f}".format(gps_hdop)
+        if gps_hdop <= 2:
+            hdop_color = color.green
+        elif gps_hdop <= 5:
+            hdop_color = color.orange
+        else:
+            hdop_color = color.red
+
+    lines = [
+        ("Fix status", fix_status_str, fix_status_color),
+        ("Satellites", "{}".format(gps_num_sats), None),
+        ("Fix quality", fix_quality_str, None),
+        ("HDOP", hdop_str, hdop_color),
+        ("Altitude", "{:.1f} m".format(gps_altitude) if gps_altitude is not None else "--", None),
+    ]
+
+    _draw_info_page("GPS Info", lines, show_down_arrow=True)
+
+
+def _draw_info_screen_2():
+    """GPS info, page 2: position + sync detail."""
     if gps_last_sync_ticks is not None:
         sync_age_s = (badge.ticks - gps_last_sync_ticks) / 1000
         rtc_sync_str = "{:.0f}s ago".format(sync_age_s)
@@ -661,30 +911,13 @@ def _draw_info_screen():
         rtc_sync_str = "never"
 
     lines = [
-        ("Fix status", "VALID" if gps_fix_valid else "NO FIX", color.green if gps_fix_valid else color.red),
-        ("Satellites", "{}".format(gps_num_sats), None),
-        ("Fix quality", fix_quality_str, None),
-        ("HDOP", "{:.1f}".format(gps_hdop) if gps_hdop is not None else "--", None),
-        ("Altitude", "{:.1f} m".format(gps_altitude) if gps_altitude is not None else "--", None),
-        ("Last fix", fix_age_str, None),
-        ("RTC last synced", rtc_sync_str, None),
+        ("RTC SYNC", rtc_sync_str, None),
         ("GGA / RMC seen", "{} / {}".format(gga_count, rmc_count), None),
-        ("NMEA lines", "{}".format(nmea_lines_seen), None),
-        ("I2C bytes / errs", "{} / {}".format(i2c_bytes_read, i2c_read_errors), None),
-        ("I2C recoveries", "{}".format(_i2c_recover_count), None),
+        ("Latitude", "{:.5f}".format(gps_lat) if gps_lat is not None else "--", None),
+        ("Longitude", "{:.5f}".format(gps_lon) if gps_lon is not None else "--", None),
     ]
 
-    screen.font = _debug_font
-    row_h = 16
-    start_y = 24
-    for i, (label, value, value_color) in enumerate(lines):
-        row_y = start_y + i * row_h
-        screen.pen = color.smoke
-        screen.text(label, 6, row_y)
-        screen.pen = value_color if value_color is not None else color.white
-        screen.text(value, 140, row_y)
-
-    _draw_hint("UP for clock")
+    _draw_info_page("GPS Info 2", lines, show_down_arrow=False)
 
 
 def update():
@@ -696,14 +929,22 @@ def update():
 
     if _screen == "clock":
         if badge.pressed(BUTTON_DOWN):
-            _screen = "info"
+            _screen = "info1"
             return
         _draw_clock_screen()
-    else:
+    elif _screen == "info1":
+        if badge.pressed(BUTTON_DOWN):
+            _screen = "info2"
+            return
         if badge.pressed(BUTTON_UP):
             _screen = "clock"
             return
-        _draw_info_screen()
+        _draw_info_screen_1()
+    else:  # "info2"
+        if badge.pressed(BUTTON_UP):
+            _screen = "info1"
+            return
+        _draw_info_screen_2()
 
 
 # Call this explicitly rather than relying solely on the app loader to find
