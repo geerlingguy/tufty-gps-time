@@ -27,12 +27,12 @@ Once a GPS fix is established (I'm using an Adafruit Mini GPS PA1010D connected 
   - If I plug in the GPS module while the app is running, it goes to 00:00:00Z and it seems like the whole thing locks up. Is it possible to hot-plug the GPS module while running?
   - Add two info pages with GPS data.
   - Add GPS sky view plot as 3rd info page.
+  - Add settings page (maybe with 'B' and then back) where you can adjust the local offset in 0.5 increments (default to the setting in code but allow user to override)
+    - Maybe also setting for 24H vs 12H time for local time display
 
 ## Fixes to be implemented
 
-  - Add settings page (maybe with 'B' and then back) where you can adjust the local offset in 0.5 increments (default to the setting in code but allow user to override)
-    - Maybe also setting for 24H vs 12H time for local time display
-  - Add 'Back' above button A on the bottom left and when clicked, take me back to the home screen (making sure RTC time is updated from GPS before going home, if GPS has a fix)
+  - Add 'Home' PNG icon (similar style, size, and transparency to the settings cog) above button A on the bottom left. When clicked, take me back to the Tufty home screen.
 
 ## PPS feature
 

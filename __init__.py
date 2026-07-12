@@ -28,6 +28,15 @@
 #   - Time format, 12H (with AM/PM) or 24H, for the local time line only -
 #     the UTC line is always 24H/ISO-style.
 #
+# Button A on the clock screen syncs the RTC from GPS (if we have a fix)
+# and returns to the badge's home menu via machine.reset() - see _go_home()
+# for why a full reset rather than something more graceful.
+#
+# Bottom row of the clock screen: home icon (A, left), cog icon (B,
+# middle), down arrow (info page, right) - home.png/cog.png if they
+# loaded, hand-drawn fallbacks otherwise. Both PNGs must be copied onto
+# the badge alongside __init__.py, not just the script itself.
+#
 # Sky View: centre = zenith, edge = horizon, azimuth clockwise from N at
 # top - a standard polar sky-view chart. Circles are GPS satellites,
 # triangles are other constellations (e.g. GLONASS). Green = used in the
@@ -828,6 +837,7 @@ def init():
     print("gps_time: rtc available:", rtc_available)
 
     _load_cog_image()
+    _load_home_image()
 
 
 _ARROW_W = 10
@@ -838,20 +848,36 @@ _ARROW_H = 7
 SKY_PLOT_MAX_RADIUS = 44
 
 
-def _draw_down_arrow(cx, cy):
-    """Small filled down-pointing triangle centred at (cx, cy)."""
+def _draw_chevron(cx, cy, pointing_down):
+    """V-shaped (or inverted-V) chevron made of two line segments, centred
+    at (cx, cy). Drawn twice with a 1px offset to fake a ~2px stroke,
+    since line() taking a width/thickness argument isn't something I've
+    been able to confirm for this API - only the plain 4-argument form is
+    documented, so this only relies on that."""
     screen.pen = color.rgb(255, 255, 255, LOCAL_ALPHA)
     hw = _ARROW_W / 2
     hh = _ARROW_H / 2
-    screen.triangle(cx - hw, cy - hh, cx + hw, cy - hh, cx, cy + hh)
+
+    if pointing_down:
+        left_y, tip_y = cy - hh, cy + hh
+    else:
+        left_y, tip_y = cy + hh, cy - hh
+
+    left_x, right_x, tip_x = cx - hw, cx + hw, cx
+
+    for dy in (0, 1):
+        screen.line(left_x, left_y + dy, tip_x, tip_y + dy)
+        screen.line(tip_x, tip_y + dy, right_x, left_y + dy)
+
+
+def _draw_down_arrow(cx, cy):
+    """2px-ish down-pointing chevron centred at (cx, cy)."""
+    _draw_chevron(cx, cy, pointing_down=True)
 
 
 def _draw_up_arrow(cx, cy):
-    """Small filled up-pointing triangle centred at (cx, cy)."""
-    screen.pen = color.rgb(255, 255, 255, LOCAL_ALPHA)
-    hw = _ARROW_W / 2
-    hh = _ARROW_H / 2
-    screen.triangle(cx - hw, cy + hh, cx + hw, cy + hh, cx, cy - hh)
+    """2px-ish up-pointing chevron centred at (cx, cy)."""
+    _draw_chevron(cx, cy, pointing_down=False)
 
 
 _COG_RADIUS = 5
@@ -885,7 +911,7 @@ def _draw_cog_icon_fallback(cx, cy):
 # to replace the blocky primitive-drawn version above. Ships alongside
 # __init__.py in the app folder - the sync script needs to copy it there
 # too, not just __init__.py.
-_COG_IMAGE_SIZE = 20
+_COG_IMAGE_SIZE = 18
 _cog_image = None
 
 
@@ -913,6 +939,75 @@ def _draw_cog_icon(cx, cy):
         screen.blit(_cog_image, rect(int(cx - half), int(cy - half), _COG_IMAGE_SIZE, _COG_IMAGE_SIZE))
     else:
         _draw_cog_icon_fallback(cx, cy)
+
+
+def _draw_home_icon_fallback(cx, cy):
+    """Simple grey house silhouette from primitives (triangle roof,
+    rectangle body) - used if home.png doesn't load."""
+    screen.pen = color.smoke
+
+    roof_w = 10
+    roof_h = 6
+    screen.triangle(cx - roof_w / 2, cy - 1, cx + roof_w / 2, cy - 1, cx, cy - 1 - roof_h)
+
+    body_w = 8
+    body_h = 6
+    screen.rectangle(int(cx - body_w / 2), int(cy - 1), body_w, body_h)
+
+
+# home.png: a 20x20 transparent PNG, same grey/alpha as cog.png, generated
+# to match its style. Ships alongside __init__.py in the app folder, same
+# as cog.png - the sync script needs to copy this one too.
+_HOME_IMAGE_SIZE = 20
+_home_image = None
+
+
+def _load_home_image():
+    """Same best-effort approach as _load_cog_image() - see its comment
+    for the caveat on Image.load(path)."""
+    global _home_image
+    try:
+        _home_image = image.load("home.png")
+        print("gps_time: loaded home.png")
+    except Exception as e:
+        _home_image = None
+        print("gps_time: could not load home.png, using drawn fallback:", e)
+
+
+def _draw_home_icon(cx, cy):
+    """Home-button hint icon, centred at (cx, cy): the loaded home.png
+    sprite if available, otherwise the hand-drawn fallback above."""
+    if _home_image is not None:
+        half = _HOME_IMAGE_SIZE / 2
+        screen.blit(_home_image, rect(int(cx - half), int(cy - half), _HOME_IMAGE_SIZE, _HOME_IMAGE_SIZE))
+    else:
+        _draw_home_icon_fallback(cx, cy)
+
+
+def _go_home():
+    """Syncs the RTC from GPS (if we have a fix), then returns to the
+    badge's home menu.
+
+    There's no documented "return to menu" call for apps using the normal
+    update() loop - the only things that lead back to the menu are the
+    physical HOME button (intercepted by the firmware, never reaching our
+    code) or main.py restarting, which the docs describe as happening "on
+    the default firmware" after badge.sleep(). We actually tried sleep()
+    for exactly this earlier in this app's history and it hard-froze the
+    badge instead of waking itself back up on schedule - a real firmware
+    quirk, not something fixable from application code, which is why that
+    attempt got backed out.
+
+    machine.reset() is a plainer tool: a full watchdog reset rather than a
+    sleep/wake cycle, so it never goes through whatever in sleep() broke
+    last time. It should land on the same "main.py restarts, menu
+    reappears" outcome, just via a full reboot rather than a graceful
+    hand-off - expect a brief reboot flicker, not an instant transition.
+    I can't fully rule out this having its own surprises without testing
+    on real hardware, but it's the more standard, lower-risk tool of the
+    two for this job."""
+    _sync_rtc_now()
+    machine.reset()
 
 
 def _draw_clock_screen():
@@ -1010,6 +1105,10 @@ def _draw_clock_screen():
 
     # -- bottom-middle: cog icon over button B hints at Settings --
     _draw_cog_icon(screen.width // 2, screen.height - 10)
+
+    # -- bottom-left: home icon over button A hints at returning to the
+    # badge's home menu --
+    _draw_home_icon(29, screen.height - 10)
 
     # -- debug overlay --
     if DEBUG_OVERLAY:
@@ -1356,6 +1455,9 @@ def update():
             return
         if badge.pressed(BUTTON_B):
             _screen = "settings"
+            return
+        if badge.pressed(BUTTON_A):
+            _go_home()
             return
         _draw_clock_screen()
     elif _screen == "info1":
