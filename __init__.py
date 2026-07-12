@@ -16,7 +16,7 @@
 # titles are "Sky View", "GPS Info 1", and "GPS Info 2" respectively.
 #   clock -> DOWN -> info1: sky plot of satellites in view, from GSV ("Sky View")
 #   info1 -> DOWN -> info2: fix status, sats, fix quality, HDOP, altitude ("GPS Info 1")
-#   info2 -> DOWN -> info3: RTC sync, GGA/RMC seen, latitude, longitude ("GPS Info 2")
+#   info2 -> DOWN -> info3: RTC sync, GGA/RMC seen, lat/lon, light level ("GPS Info 2")
 #   info1 -> UP   -> clock
 #   info2 -> UP   -> info1
 #   info3 -> UP   -> info2
@@ -42,6 +42,11 @@
 # the NO FIX -> fix transition. Uses the documented badge.caselights(level)
 # call.
 #
+# Ambient dimming: badge.light_level() drives real backlight brightness
+# via set_brightness(), smoothly ramped over AMBIENT_TRANSITION_MS, with
+# 3 levels and hysteresis so it doesn't flicker between levels right at a
+# threshold.
+#
 # Sky View: centre = zenith, edge = horizon, azimuth clockwise from N at
 # top - a standard polar sky-view chart. Circles are GPS satellites,
 # triangles are other constellations (e.g. GLONASS). Green = used in the
@@ -54,6 +59,16 @@
 import machine
 import time
 import math
+
+# Real backlight control - found via a Pimoroni forum post, not documented
+# in badge.md, so its exact value range/behaviour is unconfirmed. Guarded
+# so a missing/renamed function on this firmware build doesn't crash the
+# whole app at import time - see AMBIENT_BRIGHTNESS_LEVELS below for how
+# it's used; if this fails, dimming is just skipped entirely.
+try:
+    from badgeware import set_brightness
+except ImportError:
+    set_brightness = None
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -95,6 +110,32 @@ GPS_FIX_TIMEOUT = 10
 # which hung the whole app on launch. caselights() is Badgeware's own
 # documented API for exactly this, so it doesn't carry that same risk.
 LEDS_ENABLED = True
+
+# Ambient-light dimming, via badge.light_level() (Tufty only - a raw u16
+# from the front-mounted light sensor) and real backlight control via
+# set_brightness() (see the import above) - found via a Pimoroni forum
+# post, not in badge.md, so its value range is a guess (0.0-1.0, matching
+# caselights()'s convention elsewhere in this same API). If set_brightness
+# isn't available or throws, dimming is simply skipped rather than falling
+# back to anything on-screen.
+#
+# Three levels (not just on/off), each transition using a *different*
+# threshold depending on direction - e.g. light has to climb back above
+# AMBIENT_DIM_EXIT (not just above AMBIENT_DIM_ENTER) to leave DIM for
+# BRIGHT. That gap is the hysteresis: it stops the level flickering back
+# and forth when ambient light sits right at one boundary.
+#
+# The raw sensor range is unconfirmed/untested - these thresholds are a
+# starting point. GPS Info 2 could show the live light_level() reading if
+# you want to calibrate against your actual environment; ask if useful.
+AMBIENT_DIM_ENTER = 400     # BRIGHT -> DIM when light_level() drops below this
+AMBIENT_DIM_EXIT = 600      # DIM -> BRIGHT when light_level() rises above this
+AMBIENT_DARK_ENTER = 150    # DIM -> DARK when light_level() drops below this
+AMBIENT_DARK_EXIT = 200     # DARK -> DIM when light_level() rises above this
+
+# Real backlight brightness per level (0.0-1.0, unconfirmed range - see
+# comment above).
+AMBIENT_BRIGHTNESS_LEVELS = {"bright": 1.0, "dim": 0.75, "dark": 0.5}
 
 # PA1010D I2C address (fixed by the module, not configurable on the device).
 GPS_I2C_ADDR = 0x10
@@ -190,6 +231,29 @@ _i2c_recover_count = 0
 _led_effect_start_ticks = None
 _led_hold_ms = 0
 _led_fade_ms = 0
+
+# Current ambient dimming level: "bright", "dim", or "dark". See the
+# AMBIENT_* constants above for the hysteresis thresholds.
+_ambient_level = "bright"
+
+# True if set_brightness() is available and hasn't failed yet - flips to
+# False permanently (for this session) the first time it throws, after
+# which dimming is simply skipped.
+_backlight_working = set_brightness is not None
+_last_applied_ambient_level = None
+
+# Smooth transition state: ramps from _ambient_transition_start_value to
+# _ambient_transition_target over AMBIENT_TRANSITION_MS, rather than
+# jumping straight to the new level. _ambient_current_brightness is
+# whatever value was last actually sent to set_brightness() - used as the
+# starting point if a new transition begins before the current one
+# finishes, so interrupting a fade restarts smoothly from where it
+# actually is rather than jumping.
+AMBIENT_TRANSITION_MS = 250
+_ambient_current_brightness = 1.0
+_ambient_transition_start_value = 1.0
+_ambient_transition_target = 1.0
+_ambient_transition_start_ticks = None
 
 # Which screen update() is currently drawing: "clock", "info1", "info2",
 # "info3", or "settings".
@@ -701,6 +765,76 @@ def _update_leds():
         badge.caselights(level)
     except Exception as e:
         print("gps_time: caselights() failed:", e)
+
+
+def _update_ambient_dimming():
+    """Reads the ambient light sensor and updates _ambient_level using
+    hysteresis (see the AMBIENT_* constants). Called once per frame.
+    badge.light_level() is Tufty-only and its exact behaviour on this
+    board is unconfirmed - if the call fails or doesn't exist, this just
+    leaves the current level unchanged rather than erroring."""
+    global _ambient_level
+
+    try:
+        raw = badge.light_level()
+    except Exception:
+        return
+
+    if _ambient_level == "bright":
+        if raw < AMBIENT_DIM_ENTER:
+            _ambient_level = "dim"
+    elif _ambient_level == "dim":
+        if raw < AMBIENT_DARK_ENTER:
+            _ambient_level = "dark"
+        elif raw > AMBIENT_DIM_EXIT:
+            _ambient_level = "bright"
+    else:  # "dark"
+        if raw > AMBIENT_DARK_EXIT:
+            _ambient_level = "dim"
+
+
+def _apply_ambient_level():
+    """Applies the current _ambient_level via real backlight control, if
+    set_brightness() is available and hasn't failed yet. Smoothly ramps
+    from the current brightness to the target over AMBIENT_TRANSITION_MS
+    rather than jumping straight there - runs every frame while a
+    transition is in progress, then goes idle once it arrives. On
+    failure, flips _backlight_working off for the rest of the session,
+    after which dimming is simply skipped rather than falling back to
+    anything on-screen."""
+    global _backlight_working, _last_applied_ambient_level
+    global _ambient_current_brightness, _ambient_transition_start_value
+    global _ambient_transition_target, _ambient_transition_start_ticks
+
+    if not _backlight_working:
+        return
+
+    if _ambient_level != _last_applied_ambient_level:
+        # Level just changed - start a new ramp from wherever brightness
+        # actually is right now (which might itself be mid-ramp) to the
+        # new target, rather than restarting from the old target.
+        _last_applied_ambient_level = _ambient_level
+        _ambient_transition_start_value = _ambient_current_brightness
+        _ambient_transition_target = AMBIENT_BRIGHTNESS_LEVELS[_ambient_level]
+        _ambient_transition_start_ticks = badge.ticks
+
+    if _ambient_transition_start_ticks is None:
+        return  # already sitting at the target, nothing to do this frame
+
+    elapsed = badge.ticks - _ambient_transition_start_ticks
+    if elapsed >= AMBIENT_TRANSITION_MS:
+        _ambient_current_brightness = _ambient_transition_target
+        _ambient_transition_start_ticks = None
+    else:
+        frac = elapsed / AMBIENT_TRANSITION_MS
+        span = _ambient_transition_target - _ambient_transition_start_value
+        _ambient_current_brightness = _ambient_transition_start_value + span * frac
+
+    try:
+        set_brightness(_ambient_current_brightness)
+    except Exception as e:
+        print("gps_time: set_brightness() failed:", e)
+        _backlight_working = False
 
 
 def _sync_rtc_now():
@@ -1302,11 +1436,17 @@ def _draw_info_screen_3():
     else:
         rtc_sync_str = "never"
 
+    try:
+        light_level_str = str(badge.light_level())
+    except Exception:
+        light_level_str = "--"
+
     lines = [
         ("RTC SYNC", rtc_sync_str, None),
         ("GGA / RMC seen", "{} / {}".format(_format_compact_count(gga_count), _format_compact_count(rmc_count)), None),
         ("Latitude", "{:.5f}".format(gps_lat) if gps_lat is not None else "--", None),
         ("Longitude", "{:.5f}".format(gps_lon) if gps_lon is not None else "--", None),
+        ("Light level", light_level_str, None),
     ]
 
     _draw_info_page("GPS Info 2", lines, show_down_arrow=False)
@@ -1524,6 +1664,8 @@ def update():
     _update_fix_status()
     _maybe_sync_rtc()
     _update_leds()
+    _update_ambient_dimming()
+    _apply_ambient_level()
 
     if _screen == "clock":
         if badge.pressed(BUTTON_DOWN):
