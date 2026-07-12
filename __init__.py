@@ -3,7 +3,9 @@
 # Shows UTC (large, ISO-style with trailing "Z") and local time below it,
 # sourced from the internal RTC (kept accurate by periodic syncs from an
 # Adafruit PA1010D GPS module over QWIIC/I2C). Owner name is shown just
-# above the UTC clock, same size/style as the local time line.
+# above the UTC clock, same size/style as the local time line, with a
+# small WOPR-style scanner block bouncing left-right between the name and
+# the UTC clock, phase-locked to the displayed second (WarGames nod).
 #
 # Top-left   : "NO FIX" (red) until the GPS has a valid time fix
 # Top-middle : "N sats" - red @ 0, orange @ 1-4, green @ 5+
@@ -1273,8 +1275,43 @@ def _draw_clock_screen():
     wn = int(wn)
     hn = int(hn)
     xn = int((screen.width - wn) / 2)
-    yn = y - hn - 4
+    name_gap = 4
+    yn = y - hn - name_gap
     screen.text(OWNER_NAME, xn, yn)
+
+    # -- WOPR-style scanner: a small block sweeping left-right, halfway
+    # between the name and the UTC clock. Position comes directly from
+    # the displayed second value (a slow back-and-forth bounce, not a
+    # full sweep every second) - phase-locked to the actual displayed
+    # time rather than free-running off badge.ticks. Colour matches the
+    # UTC clock's fix-status colour (orange/yellow/white). A nod to
+    # WOPR's countdown display in WarGames.
+    if dt is not None:
+        box_w = 6
+        box_h = 4
+        margin = 12
+        track_w = screen.width - 2 * margin - box_w
+
+        # Clean 20-second triangle wave: left edge at second % 20 == 0,
+        # right edge at second % 20 == 10, ten equal one-second steps each
+        # way. (The previous version used a 38-second period that wasn't
+        # symmetric between its up and down legs - technically correct
+        # but landed on odd second values instead of round ones, which
+        # read as "wandering" rather than a clean bounce.)
+        cycle_pos = second % 20
+        if cycle_pos <= 10:
+            frac = cycle_pos / 10
+        else:
+            frac = (20 - cycle_pos) / 10
+        box_x = int(margin + frac * track_w)
+
+        gap_top = yn + hn
+        gap_bottom = y
+        scan_cy = (gap_top + gap_bottom) // 2
+        box_y = int(scan_cy - box_h / 2) + 4
+
+        screen.pen = utc_color
+        screen.rectangle(box_x, box_y, box_w, box_h)
 
     # -- local time: dimmed a touch, in the lower part of the screen --
     screen.font = _local_font
