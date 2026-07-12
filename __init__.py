@@ -8,7 +8,8 @@
 # Top-left   : "NO FIX" (red) until the GPS has a valid time fix
 # Top-middle : "N sats" - red @ 0, orange @ 1-4, green @ 5+
 # Top-right  : battery gauge (level + charging indicator)
-# UTC clock  : orange instead of white while there's no GPS fix
+# UTC clock  : orange = no fix, yellow = fix but RTC not yet synced,
+#              white = fix and RTC synced at least once
 #
 # Four screens, paged with UP/DOWN (small arrow icons hint at direction).
 # "info1/2/3" below are positions, not on-screen titles - the on-screen
@@ -36,6 +37,10 @@
 # middle), down arrow (info page, right) - home.png/cog.png if they
 # loaded, hand-drawn fallbacks otherwise. Both PNGs must be copied onto
 # the badge alongside __init__.py, not just the script itself.
+#
+# Rear case LEDs (mono/white only - not RGB): a held-then-fading flash on
+# the NO FIX -> fix transition. Uses the documented badge.caselights(level)
+# call.
 #
 # Sky View: centre = zenith, edge = horizon, azimuth clockwise from N at
 # top - a standard polar sky-view chart. Circles are GPS satellites,
@@ -81,6 +86,15 @@ FIRST_SYNC_DELAY = 20
 # How long (seconds) we'll keep showing a fix as "valid" after the last
 # good RMC sentence before falling back to "NO FIX".
 GPS_FIX_TIMEOUT = 10
+
+# Rear case LEDs: mono/white on Tufty ("four onboard white LEDs on the
+# back of the board" per badge.md), not RGB, so no colour is possible here
+# regardless of API. Controlled via the documented badge.caselights(level)
+# call (level is a float 0-1, applied to all four LEDs at once) - this
+# replaced an earlier attempt using machine.PWM() on a guessed GPIO pin,
+# which hung the whole app on launch. caselights() is Badgeware's own
+# documented API for exactly this, so it doesn't carry that same risk.
+LEDS_ENABLED = True
 
 # PA1010D I2C address (fixed by the module, not configurable on the device).
 GPS_I2C_ADDR = 0x10
@@ -168,6 +182,14 @@ _first_valid_fix_ticks = None
 _i2c_consecutive_errors = 0
 _i2c_last_recover_ticks = None
 _i2c_recover_count = 0
+
+# Simple non-blocking fade envelope: hold at full brightness for
+# _led_hold_ms, then linearly fade to off over _led_fade_ms. Both a quick
+# sync blink and the longer fix-acquired flash use this same mechanism,
+# just with different durations - see _led_flash().
+_led_effect_start_ticks = None
+_led_hold_ms = 0
+_led_fade_ms = 0
 
 # Which screen update() is currently drawing: "clock", "info1", "info2",
 # "info3", or "settings".
@@ -505,6 +527,11 @@ def _handle_nmea_sentence(line):
                 if _is_plausible_datetime(candidate):
                     dow = _day_of_week(year, month, day)
 
+                    if not gps_fix_valid:
+                        # Edge-triggered: only fires on the NO FIX -> fix
+                        # transition, not every frame the fix stays valid.
+                        _led_fix_acquired_flash()
+
                     gps_datetime = (year, month, day, hour, minute, second, dow)
                     gps_fix_valid = True
                     gps_last_fix_ticks = badge.ticks
@@ -632,6 +659,48 @@ def _update_fix_status():
         ]
         for key in stale:
             del gps_sats[key]
+
+
+def _led_flash(hold_ms, fade_ms):
+    """Starts (or restarts) the LED fade envelope: full brightness for
+    hold_ms, then a linear fade to off over fade_ms. Non-blocking -
+    _update_leds() advances it a little each frame."""
+    global _led_effect_start_ticks, _led_hold_ms, _led_fade_ms
+    _led_effect_start_ticks = badge.ticks
+    _led_hold_ms = hold_ms
+    _led_fade_ms = fade_ms
+
+
+def _led_fix_acquired_flash():
+    """Brief full-brightness hold, then fades out - for the NO FIX -> fix
+    transition specifically."""
+    _led_flash(hold_ms=100, fade_ms=800)
+
+
+def _update_leds():
+    """Advances the current fade envelope (if any) and writes the
+    resulting brightness to all four rear LEDs via badge.caselights().
+    Called every frame."""
+    global _led_effect_start_ticks
+
+    if not LEDS_ENABLED or _led_effect_start_ticks is None:
+        return
+
+    elapsed = badge.ticks - _led_effect_start_ticks
+
+    if elapsed < _led_hold_ms:
+        level = 1.0
+    elif elapsed < _led_hold_ms + _led_fade_ms:
+        level = 1.0 - (elapsed - _led_hold_ms) / _led_fade_ms
+        level = max(0.0, level)
+    else:
+        level = 0.0
+        _led_effect_start_ticks = None
+
+    try:
+        badge.caselights(level)
+    except Exception as e:
+        print("gps_time: caselights() failed:", e)
 
 
 def _sync_rtc_now():
@@ -1029,9 +1098,15 @@ def _draw_clock_screen():
         utc_str = "--:--:--Z"
         local_str = "Local --:--:--" if time_format_24h else "Local --:--:-- --"
 
-    # UTC turns orange when we don't have (or have lost) a GPS fix, so a
-    # glance at the big clock alone tells you whether to trust the time.
-    utc_color = color.white if gps_fix_valid else color.orange
+    # UTC colour is a three-state trust indicator at a glance:
+    # orange = no GPS fix, yellow = fix but the RTC hasn't been synced
+    # from it yet, white = fix and RTC synced at least once.
+    if not gps_fix_valid:
+        utc_color = color.orange
+    elif gps_last_sync_ticks is None:
+        utc_color = color.yellow
+    else:
+        utc_color = color.white
 
     # -- UTC clock: render at native size to an offscreen buffer, then
     # blit that buffer scaled up so it's bigger than any built-in font --
@@ -1448,6 +1523,7 @@ def update():
     _poll_gps()
     _update_fix_status()
     _maybe_sync_rtc()
+    _update_leds()
 
     if _screen == "clock":
         if badge.pressed(BUTTON_DOWN):
