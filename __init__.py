@@ -7,8 +7,10 @@
 # small WOPR-style scanner block bouncing left-right between the name and
 # the UTC clock, phase-locked to the displayed second (WarGames nod).
 #
-# Top-left   : "NO FIX" (red) until the GPS has a valid time fix
-# Top-middle : "N sats" - red @ 0, orange @ 1-4, green @ 5+
+# Top-left   : fix status - "NO FIX" (red), "2D FIX" (orange), or "3D FIX"
+#              (green), always shown (same logic as GPS Info 1)
+# Top-middle : "N sats" - satellites in view (GGA); colour matches the
+#              fix status label at top-left, not a sat-count threshold
 # Top-right  : battery gauge (level + charging indicator)
 # UTC clock  : orange = no fix, yellow = fix but RTC not yet synced,
 #              white = fix and RTC synced at least once
@@ -206,10 +208,31 @@ gps_sats = {}
 # missing one GSV cycle isn't the same signal as losing the fix entirely.
 SAT_STALE_TIMEOUT = 15
 
+# Separate, much shorter timeout for gps_sats_used specifically. This only
+# needs to be long enough to bridge one GPGSA/GLGSA alternation (~1-2s) -
+# the *set* of satellites actually contributing to the fix can genuinely
+# change every few seconds, so reusing SAT_STALE_TIMEOUT's 15s window here
+# made "used" satellites linger long after they'd actually dropped out of
+# the solution, showing far more green dots than were really in use.
+SAT_USED_STALE_TIMEOUT = 3
+
 # PRNs (numbers only, no talker - GSA doesn't repeat it per-satellite the
 # way GSV does) actually used in the current fix solution, from GSA fields
-# 3-14. Satellites in gps_sats but not in this set are visible but unused.
-gps_sats_used = set()
+# 3-14: {prn: last_seen_ticks}. Satellites in gps_sats but not a key here
+# are visible but unused.
+#
+# A dict with per-satellite timestamps, not a plain set that gets
+# replaced wholesale by each GSA sentence - this receiver (GPS+GLONASS)
+# appears to send separate per-constellation GSA sentences ($GPGSA, then
+# $GLGSA) rather than one combined one, and replacing the whole set on
+# each one meant each sentence wiped out the other's contribution -
+# whichever arrived last in a given cycle "won", so GPS satellites only
+# ever showed as used in the brief window before the next $GLGSA
+# overwrote them. Merging by satellite (like gps_sats already does) lets
+# both constellations' contributions coexist; SAT_STALE_TIMEOUT-based
+# pruning (see _update_fix_status()) clears one out once it's genuinely
+# stopped being reported, same as gps_sats.
+gps_sats_used = {}
 
 # Ticks of the last time we processed *any* NMEA sentence, valid or not.
 # Distinct from gps_last_fix_ticks (which only updates on a successful RMC
@@ -528,15 +551,17 @@ def _handle_nmea_sentence(line):
             except ValueError:
                 pass
 
-        used = set()
+        # Merge this sentence's satellites in by timestamp rather than
+        # replacing gps_sats_used wholesale - see the comment on
+        # gps_sats_used above for why (this receiver appears to send
+        # separate per-constellation GSA sentences that would otherwise
+        # overwrite each other every cycle).
         for i in range(3, min(15, len(fields))):
             if fields[i]:
                 try:
-                    used.add(int(fields[i]))
+                    gps_sats_used[int(fields[i])] = badge.ticks
                 except ValueError:
                     pass
-        if used:
-            gps_sats_used = used
 
     elif sentence_id.endswith("GSV"):
         # $--GSV,total_msgs,msg_num,total_sats,[prn,elev,az,snr]x1-4
@@ -712,7 +737,7 @@ def _update_fix_status():
         gps_lat = None
         gps_lon = None
         gps_sats = {}
-        gps_sats_used = set()
+        gps_sats_used = {}
     else:
         # Drop individual satellites that haven't shown up in a GSV
         # message in a while (genuinely out of view now), separate from
@@ -725,6 +750,17 @@ def _update_fix_status():
         ]
         for key in stale:
             del gps_sats[key]
+
+        # Same idea for gps_sats_used - a satellite that hasn't appeared
+        # in any GSA sentence in a while has genuinely stopped being used,
+        # not just been overwritten by the other constellation's sentence
+        # this cycle (that's what the per-satellite timestamps prevent).
+        used_stale = [
+            prn for prn, last_seen in gps_sats_used.items()
+            if (now - last_seen) > SAT_USED_STALE_TIMEOUT * 1000
+        ]
+        for prn in used_stale:
+            del gps_sats_used[prn]
 
 
 def _led_flash(hold_ms, fade_ms):
@@ -1323,21 +1359,30 @@ def _draw_clock_screen():
     y2 = int(screen.height * 0.75 - h2 / 2)
     screen.text(local_str, x2, y2)
 
-    # -- top-left: NO FIX warning --
+    # -- top-left: fix status, always shown (not just when there's no fix) -
+    # same NO FIX / 2D / 3D logic as GPS Info 1, so the two stay consistent --
     screen.font = _label_font
 
-    if not gps_fix_valid:
-        screen.pen = color.red
-        screen.text("NO FIX", 4, 4)
-
-    # -- top-middle: satellite count --
-    sats_str = "{} sats".format(gps_num_sats)
-    if gps_num_sats == 0:
-        screen.pen = color.red
-    elif gps_num_sats < 5:
-        screen.pen = color.orange
+    if not gps_fix_valid or gps_fix_type <= 1:
+        fix_label = "NO FIX"
+        fix_label_color = color.red
+    elif gps_fix_type == 2:
+        fix_label = "2D FIX"
+        fix_label_color = color.orange
     else:
-        screen.pen = color.green
+        fix_label = "3D FIX"
+        fix_label_color = color.green
+
+    screen.pen = fix_label_color
+    screen.text(fix_label, 4, 4)
+
+    # -- top-middle: satellites in view (gps_num_sats, from GGA), coloured
+    # to match the fix status label at top-left rather than its own
+    # sat-count thresholds - ties it to "is this trustworthy" instead of
+    # a raw visibility count that says nothing about fix quality on its
+    # own (see the earlier NO FIX-with-5-sats conversation) --
+    sats_str = "{} sats".format(gps_num_sats)
+    screen.pen = fix_label_color
 
     sw, _sh = screen.measure_text(sats_str)
     sw = int(sw)
