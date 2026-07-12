@@ -20,6 +20,14 @@
 #   info2 -> UP   -> info1
 #   info3 -> UP   -> info2
 #
+# A fifth screen, Settings, is reached with button B from the clock (B
+# again to return). C cycles which field UP/DOWN adjusts:
+#   - Local UTC offset, 0.5h steps, clamped to -12.0..+14.0 (real-world
+#     range). Starts from the LOCAL_OFFSET constant but is runtime-only -
+#     it resets to that default on every boot, it isn't saved to flash.
+#   - Time format, 12H (with AM/PM) or 24H, for the local time line only -
+#     the UTC line is always 24H/ISO-style.
+#
 # Sky View: centre = zenith, edge = horizon, azimuth clockwise from N at
 # top - a standard polar sky-view chart. Circles are GPS satellites,
 # triangles are other constellations (e.g. GLONASS). Green = used in the
@@ -38,7 +46,10 @@ import math
 # ---------------------------------------------------------------------------
 
 # Hours to add to UTC to get local time, e.g. -5 for US Central.
-# Half-hour offsets (e.g. 5.5) are fine too.
+# Half-hour offsets (e.g. 5.5) are fine too. This is only the *startup
+# default* - it's adjustable at runtime from the Settings screen (see
+# local_offset below), and resets back to this value on every boot rather
+# than persisting, since there's no flash/EEPROM storage wired up for it.
 LOCAL_OFFSET = -5
 
 # Displayed just above the UTC clock, same size as the local time line.
@@ -150,8 +161,17 @@ _i2c_last_recover_ticks = None
 _i2c_recover_count = 0
 
 # Which screen update() is currently drawing: "clock", "info1", "info2",
-# or "info3".
+# "info3", or "settings".
 _screen = "clock"
+
+# User-adjustable settings. Both start from their code defaults and are
+# only adjustable at runtime from the Settings screen (button B from the
+# clock) - neither persists across a reboot.
+local_offset = LOCAL_OFFSET  # hours added to UTC for local time display
+time_format_24h = False       # False = 12H with AM/PM, True = 24H
+
+_SETTINGS_FIELD_COUNT = 2
+_settings_selected_index = 0  # which field UP/DOWN currently adjusts
 
 # Debug/diagnostic counters - shown on screen since Thonny's console won't
 # catch prints from init() unless you're already attached before the app
@@ -267,6 +287,10 @@ def _format_12h(hour, minute, second):
     if h12 == 0:
         h12 = 12
     return "{:d}:{:02d}:{:02d} {}".format(h12, minute, second, period)
+
+
+def _format_24h(hour, minute, second):
+    return "{:02d}:{:02d}:{:02d}".format(hour, minute, second)
 
 
 def _format_compact_count(n):
@@ -803,6 +827,8 @@ def init():
         rtc_available = False
     print("gps_time: rtc available:", rtc_available)
 
+    _load_cog_image()
+
 
 _ARROW_W = 10
 _ARROW_H = 7
@@ -828,6 +854,67 @@ def _draw_up_arrow(cx, cy):
     screen.triangle(cx - hw, cy + hh, cx + hw, cy + hh, cx, cy - hh)
 
 
+_COG_RADIUS = 5
+_COG_HOLE_RADIUS = 2
+_COG_TOOTH = 2
+
+
+def _draw_cog_icon_fallback(cx, cy):
+    """Small grey cog/gear icon centred at (cx, cy), built from primitive
+    shapes - used if the cog.png sprite (see below) doesn't load. Blocky
+    by nature (4 teeth is about the limit of what still reads as a gear at
+    this size using rectangles), which is the whole reason cog.png exists -
+    a real drawn icon looks much cleaner than this."""
+    screen.pen = color.smoke
+
+    screen.circle(cx, cy, _COG_RADIUS)
+
+    screen.rectangle(cx - 1, cy - _COG_RADIUS - _COG_TOOTH, 2, _COG_TOOTH + 1)
+    screen.rectangle(cx - 1, cy + _COG_RADIUS - 1, 2, _COG_TOOTH + 1)
+    screen.rectangle(cx - _COG_RADIUS - _COG_TOOTH, cy - 1, _COG_TOOTH + 1, 2)
+    screen.rectangle(cx + _COG_RADIUS - 1, cy - 1, _COG_TOOTH + 1, 2)
+
+    # hollow centre hole, same double-shape trick used elsewhere (battery
+    # icon, sky-plot rings) - draw the background colour on top to punch
+    # a hole rather than leaving a solid disc
+    screen.pen = color.black
+    screen.circle(cx, cy, _COG_HOLE_RADIUS)
+
+
+# cog.png: a 20x20 transparent PNG, 6-spoke grey cog at 50% alpha, generated
+# to replace the blocky primitive-drawn version above. Ships alongside
+# __init__.py in the app folder - the sync script needs to copy it there
+# too, not just __init__.py.
+_COG_IMAGE_SIZE = 20
+_cog_image = None
+
+
+def _load_cog_image():
+    """Attempts to load cog.png once at startup. Falls back to the drawn
+    icon (_draw_cog_icon_fallback) if it's missing or won't load - this is
+    a best-effort based on Image.load(path) as documented for Badgeware's
+    sibling badge platforms; I haven't been able to confirm the exact call
+    signature against this specific Tufty firmware build, so treat this as
+    "should work" rather than guaranteed."""
+    global _cog_image
+    try:
+        _cog_image = image.load("cog.png")
+        print("gps_time: loaded cog.png")
+    except Exception as e:
+        _cog_image = None
+        print("gps_time: could not load cog.png, using drawn fallback:", e)
+
+
+def _draw_cog_icon(cx, cy):
+    """Settings-button hint icon, centred at (cx, cy): the loaded cog.png
+    sprite if available, otherwise the hand-drawn fallback above."""
+    if _cog_image is not None:
+        half = _COG_IMAGE_SIZE / 2
+        screen.blit(_cog_image, rect(int(cx - half), int(cy - half), _COG_IMAGE_SIZE, _COG_IMAGE_SIZE))
+    else:
+        _draw_cog_icon_fallback(cx, cy)
+
+
 def _draw_clock_screen():
     screen.pen = color.black
     screen.clear()
@@ -838,11 +925,14 @@ def _draw_clock_screen():
         year, month, day, hour, minute, second, _dow = dt
         utc_str = _format_utc(hour, minute, second)
 
-        ly, lm, ld, lh, lmin, lsec = _add_offset(year, month, day, hour, minute, second, LOCAL_OFFSET)
-        local_str = "Local " + _format_12h(lh, lmin, lsec)
+        ly, lm, ld, lh, lmin, lsec = _add_offset(year, month, day, hour, minute, second, local_offset)
+        if time_format_24h:
+            local_str = "Local " + _format_24h(lh, lmin, lsec)
+        else:
+            local_str = "Local " + _format_12h(lh, lmin, lsec)
     else:
         utc_str = "--:--:--Z"
-        local_str = "Local --:--:-- --"
+        local_str = "Local --:--:--" if time_format_24h else "Local --:--:-- --"
 
     # UTC turns orange when we don't have (or have lost) a GPS fix, so a
     # glance at the big clock alone tells you whether to trust the time.
@@ -915,9 +1005,11 @@ def _draw_clock_screen():
     # -- top-right: battery gauge --
     _draw_battery_icon(screen.width - _BATTERY_W - _BATTERY_NUB_W - 4, 4)
 
-    # -- bottom hint: press DOWN for the GPS info page --
     # -- bottom-right: down arrow hints at the GPS info page below --
     _draw_down_arrow(screen.width - 12, screen.height - 10)
+
+    # -- bottom-middle: cog icon over button B hints at Settings --
+    _draw_cog_icon(screen.width // 2, screen.height - 10)
 
     # -- debug overlay --
     if DEBUG_OVERLAY:
@@ -1186,6 +1278,71 @@ def _draw_info_screen_1():
         screen.text(msg, int(cx - mw / 2), int(cy - mh / 2))
 
 
+MIN_LOCAL_OFFSET = -12.0  # Baker Island, UTC-12 - the most negative in real-world use
+MAX_LOCAL_OFFSET = 14.0   # Kiribati (Line Islands), UTC+14 - the most positive in real-world use
+
+
+def _adjust_selected_setting(direction):
+    """direction is +1 or -1. Local offset adjusts by 0.5h per press and
+    clamps to the real-world UTC offset range; time format only has two
+    states, so either direction just flips it."""
+    global local_offset, time_format_24h
+
+    if _settings_selected_index == 0:
+        local_offset += 0.5 * direction
+        if local_offset > MAX_LOCAL_OFFSET:
+            local_offset = MAX_LOCAL_OFFSET
+        elif local_offset < MIN_LOCAL_OFFSET:
+            local_offset = MIN_LOCAL_OFFSET
+    else:
+        time_format_24h = not time_format_24h
+
+
+def _draw_settings_screen():
+    screen.pen = color.black
+    screen.clear()
+
+    screen.font = _label_font
+    screen.pen = color.white
+    screen.text("Settings", 4, 4)
+
+    _draw_battery_icon(screen.width - _BATTERY_W - _BATTERY_NUB_W - 4, 4)
+
+    start_y = 4 + _BATTERY_H + 2 + 10
+
+    screen.font = _debug_font
+    _, sample_h = screen.measure_text("Ay")
+    row_h = int(sample_h) + 6
+    right_margin = 6
+
+    offset_str = "{:+.1f}h".format(local_offset)
+    format_str = "24H" if time_format_24h else "12H"
+
+    rows = [
+        ("Local UTC offset", offset_str),
+        ("Time format", format_str),
+    ]
+
+    for i, (label, value) in enumerate(rows):
+        row_y = start_y + i * row_h
+        selected = (i == _settings_selected_index)
+        row_color = color.white if selected else color.smoke
+
+        screen.pen = row_color
+        screen.text(("> " if selected else "  ") + label, 6, row_y)
+
+        vw, _vh = screen.measure_text(value)
+        screen.text(value, screen.width - int(vw) - right_margin, row_y)
+
+    hint = "C:select  UP/DN:adjust  B:back"
+    screen.pen = color.smoke
+    hw, hh = screen.measure_text(hint)
+    if hw > screen.width - 8:
+        hint = "C:sel UP/DN:adj B:back"
+        hw, hh = screen.measure_text(hint)
+    screen.text(hint, 4, screen.height - int(hh) - 3)
+
+
 def update():
     global _screen
 
@@ -1196,6 +1353,9 @@ def update():
     if _screen == "clock":
         if badge.pressed(BUTTON_DOWN):
             _screen = "info1"
+            return
+        if badge.pressed(BUTTON_B):
+            _screen = "settings"
             return
         _draw_clock_screen()
     elif _screen == "info1":
@@ -1214,11 +1374,27 @@ def update():
             _screen = "info1"
             return
         _draw_info_screen_2()
-    else:  # "info3"
+    elif _screen == "info3":
         if badge.pressed(BUTTON_UP):
             _screen = "info2"
             return
         _draw_info_screen_3()
+    else:  # "settings"
+        global _settings_selected_index
+
+        if badge.pressed(BUTTON_B):
+            _screen = "clock"
+            return
+        if badge.pressed(BUTTON_C):
+            _settings_selected_index = (_settings_selected_index + 1) % _SETTINGS_FIELD_COUNT
+            return
+        if badge.pressed(BUTTON_UP):
+            _adjust_selected_setting(1)
+            return
+        if badge.pressed(BUTTON_DOWN):
+            _adjust_selected_setting(-1)
+            return
+        _draw_settings_screen()
 
 
 # Call this explicitly rather than relying solely on the app loader to find

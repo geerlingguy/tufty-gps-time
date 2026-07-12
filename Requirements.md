@@ -30,6 +30,8 @@ Once a GPS fix is established (I'm using an Adafruit Mini GPS PA1010D connected 
 
 ## Fixes to be implemented
 
+  - Add settings page (maybe with 'B' and then back) where you can adjust the local offset in 0.5 increments (default to the setting in code but allow user to override)
+    - Maybe also setting for 24H vs 12H time for local time display
   - Add 'Back' above button A on the bottom left and when clicked, take me back to the home screen (making sure RTC time is updated from GPS before going home, if GPS has a fix)
 
 ## PPS feature
