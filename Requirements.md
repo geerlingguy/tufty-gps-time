@@ -30,12 +30,14 @@ Once a GPS fix is established (I'm using an Adafruit Mini GPS PA1010D connected 
   - Add settings page (maybe with 'B' and then back) where you can adjust the local offset in 0.5 increments (default to the setting in code but allow user to override)
     - Maybe also setting for 24H vs 12H time for local time display
   - Add 'Home' PNG icon (similar style, size, and transparency to the settings cog) above button A on the bottom left. When clicked, take me back to the Tufty home screen.
+  - Use `light_level()` to make screen dimmer in dark environments? Make sure to use some hysteresis.
 
 ## Fixes to be implemented
 
-  - Use `light_level()` to make screen dimmer in dark environments? Make sure to use some hysteresis.
+  - N/A
 
 ## PPS feature
 
+  - Would need a pin to PPS... not sure if there is one available
   - Add PPS led blink on back when PPS pulse is received
   - Add code to discipline to PPS signal
