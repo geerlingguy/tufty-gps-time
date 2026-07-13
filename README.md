@@ -2,7 +2,7 @@
 
 A GPS time app for Pimoroni's [Tufty 2350](https://shop.pimoroni.com/products/tufty-2350?variant=55811986194811), using the [Adafruit Mini GPS PA1010D](https://www.adafruit.com/product/4415) GPS module.
 
-TODO: Photo of badge.
+<p align="center"><img src="images/tufty-2350-gps-time.jpg" width="550" height="auto"></p>
 
 The PA1010D is built around MediaTek's [MT3333 GPS SoC](https://ia902802.us.archive.org/21/items/mt3333-datasheet/MT3333_Datasheet.pdf). It uses around 30 mW of power when tracking, and 40 mW during acquisition. PPS output is accurate to within ±20 ns.
 
@@ -24,13 +24,23 @@ For best GPS reception, the patch antenna (the big ceramic thing on top of the G
 
 TODO: Design and print a bracket based on [Badgeware Multi-sensor Stick Clip](https://www.printables.com/model/1726590-badgeware-multi-sensor-stick-clip) that holds GPS module vertically at top of badge.
 
+Sources used for 3D modeling the bracket:
+
+  - [Pimoroni Badgeware Blank](https://www.printables.com/model/1779998-pimoroni-badgeware-blank/files)
+  - [Pimoroni Badgeware Multi-Sensor Stick Clip](https://www.printables.com/model/1726590-badgeware-multi-sensor-stick-clip)
+  - [AdaFruit 4415 Mini GPS PA1010D](https://learn.adafruit.com/adafruit-mini-gps-pa1010d-module/downloads)
+
 This bracket is also useful if you're debugging the badge or displaying it on your desk using the [Badgeware stand](https://www.printables.com/model/1726520-badgeware-stand).
 
 ### PPS Output
 
-I might add PPS clock disciplining internally, but I would also like to have an SMA or BNC plug available for PPS output directly from the GPS module. See discussion [PPS input on Tufty GPIO pin?](https://forums.pimoroni.com/t/pps-input-on-tufty-gpio-pin/28958) for more.
+I would also like to have an SMA or BNC plug available for PPS output directly from the GPS module.
 
-TODO: Add some method for PPS testing, maybe a little two-pin header with a female BNC or SMA connector soldered to a plug (to prevent too much stress on the module).
+TODO: Add method for PPS testing, maybe two-pin header with a female BNC or SMA connector soldered to a two-pin plug that goes into that header.
+
+### PPS Input
+
+See discussion [PPS input on Tufty GPIO pin?](https://forums.pimoroni.com/t/pps-input-on-tufty-gpio-pin/28958) for more on PPS input.
 
 ## Software
 
@@ -53,4 +63,4 @@ Updating the software:
 
 ## Author
 
-Authored by [Jeff Geerling](https://www.jeffgeerling.com) in 2026, with help from Claude's free model.
+Authored by [Jeff Geerling](https://www.jeffgeerling.com) in 2026, with help from Claude Sonnet 5 and Pimoroni's excellent forum users.
