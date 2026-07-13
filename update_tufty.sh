@@ -3,6 +3,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="$SCRIPT_DIR/gps_time"
 DEST_DIR="/Volumes/TUFTY/apps/gps_time"
 
 if [ ! -d "/Volumes/TUFTY" ]; then
@@ -10,11 +11,16 @@ if [ ! -d "/Volumes/TUFTY" ]; then
     exit 1
 fi
 
-# Copy contents of __init__.py to /Volumes/TUFTY/apps/gps_time/__init__.py
-mkdir -p "$DEST_DIR"
-cp "$SCRIPT_DIR/__init__.py" "$DEST_DIR/__init__.py"
-echo "Copied __init__.py to $DEST_DIR"
+if [ ! -d "$SRC_DIR" ]; then
+    echo "Error: source directory not found at $SRC_DIR" >&2
+    exit 1
+fi
 
-# Eject the 'TUFTY' volume (make this work on macOS)
+# Copy all contents of gps_time/ into $DEST_DIR/
+mkdir -p "$DEST_DIR"
+cp -R "$SRC_DIR"/. "$DEST_DIR/"
+echo "Copied contents of $SRC_DIR to $DEST_DIR"
+
+# Eject the 'TUFTY' volume
 diskutil eject /Volumes/TUFTY
 echo "Ejected TUFTY"

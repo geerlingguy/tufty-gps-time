@@ -38,11 +38,13 @@ This process was validated on a Mac running macOS 26. Use on other OSes may vary
 
 To install the GPS Time app on your Tufty 2350 badge:
 
-  1. Plug Tufty 2350 into your computer with a USB cable.
+  1. Plug Tufty 2350 into your computer with a USB cable
   2. Double-click the 'RESET' button on the back of the badge to enter USB Disk Mode
-  3. Copy over the entire contents of this repository into a new folder titled `TUFTY/apps/gps_time`
+  3. Copy over the entire `gps_time` directory into Tufty's `apps` directory
   4. Eject the TUFTY volume.
-  5. The GPS Time app should be showing in the apps list now.
+  5. The GPS Time app should be showing in the apps list now
+
+Alternatively, you can just run `update_tufty.sh` to copy over the app once you have the TUFTY volume mounted.
 
 Updating the software:
 
