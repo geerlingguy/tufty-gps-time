@@ -18,6 +18,21 @@ Plug the [Adafruit PA1010D GPS](https://www.adafruit.com/product/4415) module di
 
 You can plug into either side of the GPS module.
 
+### PPS Watch Compatibility
+
+The GPS Time app includes support for the u-blox MAX-M10S, but is is not enabled by default. To use it (e.g. with a [PPS Watch](https://github.com/idlehandsdev/pps-watch)'s QWIIC connector output):
+
+  1. Plug a QWIIC cable between the Tufty and the MAX-M10S device
+  1. Turn on the Tufty, then turn on the MAX-M10S device (if it requires separate power, as is the case with the PPS Watch)
+  1. Open the GPS Time app
+  1. Go into settings (the Cog icon)
+  1. Move down to the 'GPS Module Address' setting, and change it from `0x10` to `0x42`
+  1. Press B to go back to the GPS Time main screen
+
+At this point, the GPS Time app should configure the MAX-M10S to send over NMEA sentences so it can get timing data.
+
+> **NOTE**: The first version of the PPS Watch PCB had the QWIIC connector reversed. [I made a QWIIC crossover cable](https://github.com/geerlingguy/tufty-gps-time/issues/1) for compatibility. If you have one of these early PPS Watches, make sure you reverse the connections between the boards!
+
 ### 3D Printed GPS bracket
 
 For best GPS reception, the patch antenna (the big ceramic thing on top of the GPS chip) should face the sky. So I've modified the official [Badgeware Multi-sensor Stick Clip](https://www.printables.com/model/1726590-badgeware-multi-sensor-stick-clip) design to hold the GPS module vertically, so it will be pointed 'up' while you're wearing the badge.
