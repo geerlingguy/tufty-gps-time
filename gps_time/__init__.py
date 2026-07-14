@@ -32,6 +32,10 @@
 #     it resets to that default on every boot, it isn't saved to flash.
 #   - Time format, 12H (with AM/PM) or 24H, for the local time line only -
 #     the UTC line is always 24H/ISO-style.
+#   - GPS I2C Address, cycles gps_i2c_addr between PA1010D (0x10) and
+#     u-blox (0x42) - runtime-only like the other two fields. Switching to
+#     0x42 sends a UBX-CFG-VALSET enabling NMEA output on that module (see
+#     _configure_gps_ubx()) - confirmed working with a MAX-M10S over Qwiic.
 #
 # Button A on the clock screen syncs the RTC from GPS (if we have a fix)
 # and returns to the badge's home menu via machine.reset() - see _go_home()
@@ -141,8 +145,15 @@ AMBIENT_DARK_EXIT = 200     # DARK -> DIM when light_level() rises above this
 # comment above).
 AMBIENT_BRIGHTNESS_LEVELS = {"bright": 1.0, "dim": 0.75, "dark": 0.5}
 
-# PA1010D I2C address (fixed by the module, not configurable on the device).
+# Default GPS module I2C address at boot - PA1010D is 0x10. Adjustable at
+# runtime from Settings (gps_i2c_addr below) to swap modules, e.g. a
+# u-blox module at 0x42, without reflashing. Resets to this default on
+# every boot, like local_offset/time_format_24h.
 GPS_I2C_ADDR = 0x10
+
+# Addresses cycled through by the Settings screen's "GPS I2C Address"
+# field: PA1010D (0x10), then u-blox (0x42 - MAX-M10S and similar).
+_GPS_I2C_ADDR_CHOICES = (0x10, 0x42)
 
 # QWIIC/I2C bus setup. Pimoroni's most common Qw/ST pin mapping is GP4/GP5,
 # but this isn't documented for Tufty 2350 specifically - if the GPS never
@@ -284,13 +295,14 @@ _ambient_transition_start_ticks = None
 # "info3", or "settings".
 _screen = "clock"
 
-# User-adjustable settings. Both start from their code defaults and are
+# User-adjustable settings. All start from their code defaults and are
 # only adjustable at runtime from the Settings screen (button B from the
-# clock) - neither persists across a reboot.
+# clock) - none persist across a reboot.
 local_offset = LOCAL_OFFSET  # hours added to UTC for local time display
 time_format_24h = False       # False = 12H with AM/PM, True = 24H
+gps_i2c_addr = GPS_I2C_ADDR   # which GPS module address _poll_gps()/_configure_gps_for_address() talk to
 
-_SETTINGS_FIELD_COUNT = 2
+_SETTINGS_FIELD_COUNT = 3
 _settings_selected_index = 0  # which field UP/DOWN currently adjusts
 
 # Debug/diagnostic counters - shown on screen since Thonny's console won't
@@ -646,7 +658,7 @@ def _poll_gps():
 
     # Drain everything currently waiting instead of reading one fixed-size
     # chunk. The module streams continuously (now ~11.5KB/sec at the
-    # 115200 baud we configure it for in _configure_gps(), up from 9600
+    # 115200 baud we configure it for in _configure_gps_pmtk(), up from 9600
     # default) regardless of how often we poll - if update() runs slower
     # than that (e.g. because rendering the scaled clock takes a while),
     # reading only one 32-byte chunk per frame falls further behind every
@@ -656,7 +668,7 @@ def _poll_gps():
     # frame.
     for _ in range(_I2C_MAX_READS_PER_POLL):
         try:
-            chunk = _i2c.readfrom(GPS_I2C_ADDR, 32)
+            chunk = _i2c.readfrom(gps_i2c_addr, 32)
         except OSError:
             i2c_read_errors += 1
             _i2c_consecutive_errors += 1
@@ -949,7 +961,7 @@ def _i2c_recover():
         _i2c = machine.I2C(I2C_ID, sda=machine.Pin(I2C_SDA_PIN), scl=machine.Pin(I2C_SCL_PIN), freq=I2C_FREQ)
         i2c_scan_result = _i2c.scan()
         print("gps_time: i2c devices found after recovery:", i2c_scan_result)
-        _configure_gps()
+        _configure_gps_for_address()
     except Exception as e:
         _i2c = None
         i2c_scan_result = "recovery failed"
@@ -1036,21 +1048,96 @@ _PMTK_SET_NMEA_UPDATE_1HZ = b"$PMTK220,1000*1F\r\n"
 _PMTK_SET_BAUD_115200 = b"$PMTK251,115200*1F\r\n"
 
 
-def _configure_gps():
+def _configure_gps_pmtk():
+    """PA1010D (and other MTK-chipset modules) configuration - the original
+    _configure_gps() body, just renamed now that there's more than one
+    module type to configure. See the PMTK constants above for what each
+    command does."""
     if _i2c is None:
         return
     try:
-        _i2c.writeto(GPS_I2C_ADDR, _PMTK_SET_NMEA_OUTPUT_RMCGGAGSAGSV)
+        _i2c.writeto(gps_i2c_addr, _PMTK_SET_NMEA_OUTPUT_RMCGGAGSAGSV)
     except OSError as e:
         print("gps_time: PMTK314 write failed:", e)
     try:
-        _i2c.writeto(GPS_I2C_ADDR, _PMTK_SET_NMEA_UPDATE_1HZ)
+        _i2c.writeto(gps_i2c_addr, _PMTK_SET_NMEA_UPDATE_1HZ)
     except OSError as e:
         print("gps_time: PMTK220 write failed:", e)
     try:
-        _i2c.writeto(GPS_I2C_ADDR, _PMTK_SET_BAUD_115200)
+        _i2c.writeto(gps_i2c_addr, _PMTK_SET_BAUD_115200)
     except OSError as e:
         print("gps_time: PMTK251 write failed:", e)
+
+
+# ---------------------------------------------------------------------------
+# u-blox (UBX protocol) configuration - used when gps_i2c_addr is 0x42.
+# Confirmed working with a MAX-M10S (Sean Hodgins' PPS Watch) over Qwiic.
+#
+# u-blox M8/M9/M10-gen modules use a key/value config interface rather than
+# MTK-style ASCII commands. Only one key is needed: CFG-I2COUTPROT-NMEA
+# (0x10720002), which enables NMEA sentences over I2C/DDC so _poll_gps()
+# has something to parse. Sent to the RAM layer only (not BBR/Flash), so
+# it doesn't permanently alter a borrowed/shared GPS module.
+# ---------------------------------------------------------------------------
+
+_UBX_SYNC = b"\xb5\x62"
+_UBX_CLASS_CFG = 0x06
+_UBX_ID_CFG_VALSET = 0x8A
+_UBX_LAYER_RAM = 0x01
+
+_UBX_KEY_CFG_I2COUTPROT_NMEA = 0x10720002
+
+
+def _ubx_checksum(data):
+    """8-bit Fletcher checksum over the class/id/length/payload bytes, per
+    the UBX frame spec (not including the 0xB5 0x62 sync bytes)."""
+    ck_a = 0
+    ck_b = 0
+    for b in data:
+        ck_a = (ck_a + b) & 0xFF
+        ck_b = (ck_b + ck_a) & 0xFF
+    return ck_a, ck_b
+
+
+def _ubx_valset_bool(key_id, value, layers=_UBX_LAYER_RAM):
+    """Builds a complete UBX-CFG-VALSET frame setting a single 1-byte
+    ("L"/bool-type) configuration item to 0 or 1. Only single-item, non-
+    transactional VALSET is needed here, so the rarely-used fields
+    (version, reserved, transaction id) are just left at 0."""
+    payload = bytearray()
+    payload.append(0x00)          # version: 0 = no transaction
+    payload.append(layers & 0xFF)  # which layer(s) to write
+    payload += b"\x00\x00"          # reserved
+    payload += key_id.to_bytes(4, "little")
+    payload.append(1 if value else 0)
+
+    length = len(payload)
+    frame_body = bytes([_UBX_CLASS_CFG, _UBX_ID_CFG_VALSET]) + length.to_bytes(2, "little") + bytes(payload)
+    ck_a, ck_b = _ubx_checksum(frame_body)
+
+    return _UBX_SYNC + frame_body + bytes([ck_a, ck_b])
+
+
+def _configure_gps_ubx():
+    """u-blox module configuration, sent when gps_i2c_addr is 0x42. Enables
+    NMEA output on I2C so _poll_gps() (NMEA-only, no UBX binary parsing)
+    has something to read. Verified against a real MAX-M10S."""
+    if _i2c is None:
+        return
+    try:
+        _i2c.writeto(gps_i2c_addr, _ubx_valset_bool(_UBX_KEY_CFG_I2COUTPROT_NMEA, True))
+    except OSError as e:
+        print("gps_time: UBX-CFG-VALSET (I2COUTPROT-NMEA) write failed:", e)
+
+
+def _configure_gps_for_address():
+    """Dispatches to the right configuration routine for whichever module
+    is currently selected at gps_i2c_addr (set from the Settings screen, or
+    left at the GPS_I2C_ADDR default at boot)."""
+    if gps_i2c_addr == 0x42:
+        _configure_gps_ubx()
+    else:
+        _configure_gps_pmtk()
 
 
 # ---------------------------------------------------------------------------
@@ -1064,7 +1151,7 @@ def init():
         _i2c = machine.I2C(I2C_ID, sda=machine.Pin(I2C_SDA_PIN), scl=machine.Pin(I2C_SCL_PIN), freq=I2C_FREQ)
         i2c_scan_result = _i2c.scan()
         print("gps_time: i2c devices found:", i2c_scan_result)
-        _configure_gps()
+        _configure_gps_for_address()
     except Exception as e:
         _i2c = None
         i2c_scan_result = "init failed"
@@ -1679,10 +1766,12 @@ MAX_LOCAL_OFFSET = 14.0   # Kiribati (Line Islands), UTC+14 - the most positive 
 
 
 def _adjust_selected_setting(direction):
-    """direction is +1 or -1. Local offset adjusts by 0.5h per press and
-    clamps to the real-world UTC offset range; time format only has two
-    states, so either direction just flips it."""
-    global local_offset, time_format_24h
+    """direction is +1 or -1. Local offset adjusts by 0.5h per press,
+    clamped to the real-world UTC offset range. Time format just flips
+    between its two states. GPS I2C address cycles _GPS_I2C_ADDR_CHOICES
+    and calls _configure_gps_for_address() to reconfigure the module at
+    the new address."""
+    global local_offset, time_format_24h, gps_i2c_addr
 
     if _settings_selected_index == 0:
         local_offset += 0.5 * direction
@@ -1690,8 +1779,13 @@ def _adjust_selected_setting(direction):
             local_offset = MAX_LOCAL_OFFSET
         elif local_offset < MIN_LOCAL_OFFSET:
             local_offset = MIN_LOCAL_OFFSET
-    else:
+    elif _settings_selected_index == 1:
         time_format_24h = not time_format_24h
+    else:
+        idx = _GPS_I2C_ADDR_CHOICES.index(gps_i2c_addr)
+        idx = (idx + direction) % len(_GPS_I2C_ADDR_CHOICES)
+        gps_i2c_addr = _GPS_I2C_ADDR_CHOICES[idx]
+        _configure_gps_for_address()
 
 
 def _draw_settings_screen():
@@ -1713,10 +1807,12 @@ def _draw_settings_screen():
 
     offset_str = "{:+.1f}h".format(local_offset)
     format_str = "24H" if time_format_24h else "12H"
+    addr_str = "0x{:02X}".format(gps_i2c_addr)
 
     rows = [
         ("Local UTC offset", offset_str),
         ("Time format", format_str),
+        ("GPS I2C Address", addr_str),
     ]
 
     for i, (label, value) in enumerate(rows):
