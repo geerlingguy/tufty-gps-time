@@ -32,12 +32,10 @@
 #     it resets to that default on every boot, it isn't saved to flash.
 #   - Time format, 12H (with AM/PM) or 24H, for the local time line only -
 #     the UTC line is always 24H/ISO-style.
-#   - GPS Module Address, cycles gps_i2c_addr through the PA1010D (0x10)
-#     and u-blox (0x42) I2C addresses - same runtime-only, resets-on-boot
-#     behaviour as the other two fields. Switching to 0x42 fires off
-#     _configure_gps_ubx() to try enabling NMEA output on that module over
-#     I2C (u-blox modules speak a different config protocol than the
-#     PA1010D's MTK commands) - see that function's docstring for caveats.
+#   - GPS I2C Address, cycles gps_i2c_addr between PA1010D (0x10) and
+#     u-blox (0x42) - runtime-only like the other two fields. Switching to
+#     0x42 sends a UBX-CFG-VALSET enabling NMEA output on that module (see
+#     _configure_gps_ubx()) - confirmed working with a MAX-M10S over Qwiic.
 #
 # Button A on the clock screen syncs the RTC from GPS (if we have a fix)
 # and returns to the badge's home menu via machine.reset() - see _go_home()
@@ -147,17 +145,14 @@ AMBIENT_DARK_EXIT = 200     # DARK -> DIM when light_level() rises above this
 # comment above).
 AMBIENT_BRIGHTNESS_LEVELS = {"bright": 1.0, "dim": 0.75, "dark": 0.5}
 
-# Default GPS module I2C address at boot - PA1010D is 0x10. This is only
-# the *startup default*; it's adjustable at runtime from the Settings
-# screen (see gps_i2c_addr below) to swap between GPS modules that live at
-# different addresses (e.g. a u-blox module at 0x42) without reflashing.
-# Like local_offset/time_format_24h, the runtime value resets to this
-# default on every boot rather than persisting.
+# Default GPS module I2C address at boot - PA1010D is 0x10. Adjustable at
+# runtime from Settings (gps_i2c_addr below) to swap modules, e.g. a
+# u-blox module at 0x42, without reflashing. Resets to this default on
+# every boot, like local_offset/time_format_24h.
 GPS_I2C_ADDR = 0x10
 
-# Known GPS module addresses cycled through by the Settings screen's "GPS
-# Module Address" field: PA1010D, then u-blox (MAX-M10S and similar modules
-# default to 0x42).
+# Addresses cycled through by the Settings screen's "GPS I2C Address"
+# field: PA1010D (0x10), then u-blox (0x42 - MAX-M10S and similar).
 _GPS_I2C_ADDR_CHOICES = (0x10, 0x42)
 
 # QWIIC/I2C bus setup. Pimoroni's most common Qw/ST pin mapping is GP4/GP5,
@@ -1076,19 +1071,13 @@ def _configure_gps_pmtk():
 
 # ---------------------------------------------------------------------------
 # u-blox (UBX protocol) configuration - used when gps_i2c_addr is 0x42.
+# Confirmed working with a MAX-M10S (Sean Hodgins' PPS Watch) over Qwiic.
 #
-# u-blox M8/M9/M10-generation modules (e.g. MAX-M10S) use a key/value
-# "configuration interface" rather than MTK-style ASCII commands. We only
-# need one key here: CFG-I2COUTPROT-NMEA, which tells the module to include
-# NMEA sentences (not just UBX binary messages) in what it sends back over
-# the I2C/DDC interface. Key ID 0x10720002 and the UBX-CFG-VALSET frame
-# layout below are from u-blox's public interface description (same key
-# IDs are shared across the M8/M9/M10 config interface generations).
-#
-# Sent to the RAM layer only (not BBR/Flash) - deliberately non-persistent,
-# matching every other runtime setting in this file: it resets to the
-# module's own defaults on power-cycle rather than permanently altering a
-# borrowed/shared GPS module.
+# u-blox M8/M9/M10-gen modules use a key/value config interface rather than
+# MTK-style ASCII commands. Only one key is needed: CFG-I2COUTPROT-NMEA
+# (0x10720002), which enables NMEA sentences over I2C/DDC so _poll_gps()
+# has something to parse. Sent to the RAM layer only (not BBR/Flash), so
+# it doesn't permanently alter a borrowed/shared GPS module.
 # ---------------------------------------------------------------------------
 
 _UBX_SYNC = b"\xb5\x62"
@@ -1130,13 +1119,9 @@ def _ubx_valset_bool(key_id, value, layers=_UBX_LAYER_RAM):
 
 
 def _configure_gps_ubx():
-    """u-blox module configuration - sent whenever gps_i2c_addr is set to
-    0x42. Enables NMEA as an output protocol on I2C so _poll_gps() (which
-    only understands NMEA, not raw UBX binary messages) has something to
-    parse. This is a best-effort attempt: u-blox modules vary in which
-    configuration interface they accept, and this hasn't been verified
-    against real hardware over I2C yet - if it doesn't take, the module
-    may need a one-time u-center session over its Qwiic port instead."""
+    """u-blox module configuration, sent when gps_i2c_addr is 0x42. Enables
+    NMEA output on I2C so _poll_gps() (NMEA-only, no UBX binary parsing)
+    has something to read. Verified against a real MAX-M10S."""
     if _i2c is None:
         return
     try:
@@ -1781,12 +1766,11 @@ MAX_LOCAL_OFFSET = 14.0   # Kiribati (Line Islands), UTC+14 - the most positive 
 
 
 def _adjust_selected_setting(direction):
-    """direction is +1 or -1. Local offset adjusts by 0.5h per press and
-    clamps to the real-world UTC offset range; time format only has two
-    states, so either direction just flips it. GPS module address cycles
-    through _GPS_I2C_ADDR_CHOICES and, when it lands on 0x42 (u-blox),
-    kicks off _configure_gps_for_address() to try switching that module
-    into NMEA-over-I2C output - see that function for what it sends."""
+    """direction is +1 or -1. Local offset adjusts by 0.5h per press,
+    clamped to the real-world UTC offset range. Time format just flips
+    between its two states. GPS I2C address cycles _GPS_I2C_ADDR_CHOICES
+    and calls _configure_gps_for_address() to reconfigure the module at
+    the new address."""
     global local_offset, time_format_24h, gps_i2c_addr
 
     if _settings_selected_index == 0:
@@ -1828,7 +1812,7 @@ def _draw_settings_screen():
     rows = [
         ("Local UTC offset", offset_str),
         ("Time format", format_str),
-        ("GPS Module Address", addr_str),
+        ("GPS I2C Address", addr_str),
     ]
 
     for i, (label, value) in enumerate(rows):
