@@ -37,7 +37,7 @@ At this point, the GPS Time app should configure the MAX-M10S to send over NMEA 
 
 For best GPS reception, the patch antenna (the big ceramic thing on top of the GPS chip) should face the sky. So I've modified the official [Badgeware Multi-sensor Stick Clip](https://www.printables.com/model/1726590-badgeware-multi-sensor-stick-clip) design to hold the GPS module vertically, so it will be pointed 'up' while you're wearing the badge.
 
-TODO: Design and print a bracket based on [Badgeware Multi-sensor Stick Clip](https://www.printables.com/model/1726590-badgeware-multi-sensor-stick-clip) that holds GPS module vertically at top of badge.
+TODO: See [Issue #3 - Design 3D printed 'GPS HAT' mount for PA1010D](https://github.com/geerlingguy/tufty-gps-time/issues/3).
 
 Sources used for 3D modeling the bracket:
 
