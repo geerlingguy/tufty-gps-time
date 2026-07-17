@@ -71,9 +71,11 @@
 # - see _maybe_log_gps(). A new file is started fresh each power-on -
 # gps_log_0001.csv, gps_log_0002.csv, etc. (see _next_gps_log_path()) -
 # rather than one file capped/rotated over time, on the assumption the
-# badge gets powered off nightly. _go_home() also flushes any buffered-but-
-# unwritten rows before resetting, since that's the one "leaving the app"
-# moment the code gets to catch.
+# badge gets powered off nightly. Files are relative paths (no leading
+# "/"), same as cog.png/home.png below, so they land in this app's own
+# directory rather than the filesystem root. _go_home() also flushes any
+# buffered-but-unwritten rows before resetting, since that's the one
+# "leaving the app" moment the code gets to catch.
 
 import machine
 import time
@@ -178,7 +180,7 @@ _GPS_I2C_ADDR_CHOICES = (0x10, 0x42)
 # GPS_LOG_PREFIX/GPS_LOG_SUFFIX name each one gps_log_0001.csv,
 # gps_log_0002.csv, etc., picking up wherever the highest existing number
 # left off.
-GPS_LOG_PREFIX = "/gps_log_"
+GPS_LOG_PREFIX = "gps_log_"
 GPS_LOG_SUFFIX = ".csv"
 GPS_LOG_SAMPLE_INTERVAL = 5   # seconds between readings taken (in RAM)
 GPS_LOG_WRITE_INTERVAL = 60   # seconds between batched writes to flash
@@ -971,15 +973,16 @@ def _fix_quality_label(fix_type):
 
 
 def _next_gps_log_path():
-    """Scans the filesystem root for existing gps_log_NNNN.csv files and
-    returns the path for the next one in sequence (highest existing index
-    + 1, or 0001 if none exist yet). This is what gives each power-on its
-    own fresh file."""
+    """Scans this app's own directory (the current working directory the
+    badge loader runs it from - same place cog.png/home.png are loaded
+    from) for existing gps_log_NNNN.csv files, and returns the path for
+    the next one in sequence (highest existing index + 1, or 0001 if none
+    exist yet). This is what gives each power-on its own fresh file."""
     max_index = 0
     try:
-        for name in os.listdir("/"):
-            if name.startswith(GPS_LOG_PREFIX[1:]) and name.endswith(GPS_LOG_SUFFIX):
-                middle = name[len(GPS_LOG_PREFIX) - 1:-len(GPS_LOG_SUFFIX)]
+        for name in os.listdir("."):
+            if name.startswith(GPS_LOG_PREFIX) and name.endswith(GPS_LOG_SUFFIX):
+                middle = name[len(GPS_LOG_PREFIX):-len(GPS_LOG_SUFFIX)]
                 try:
                     idx = int(middle)
                     if idx > max_index:
@@ -987,7 +990,7 @@ def _next_gps_log_path():
                 except ValueError:
                     continue
     except OSError as e:
-        print("gps_time: couldn't list / for existing logs:", e)
+        print("gps_time: couldn't list app directory for existing logs:", e)
 
     return "{}{:04d}{}".format(GPS_LOG_PREFIX, max_index + 1, GPS_LOG_SUFFIX)
 
