@@ -76,6 +76,17 @@ Updating the software:
   1. Do all the above to get the TUFTY volume mounted.
   1. Run the `update_tufty.sh` script to copy over the updated Python code and unmount the TUFTY volume.
 
+### GPS Data Logging
+
+GPS Data Logging is enabled by default. You can disable it on the Settings screen. To get a GPS log file off the device, run the following while the device is on (note: this will lock up whatever is running currently):
+
+  1. `pip install mpremote`
+  1. `./download_gps_log.sh` (add `--clear` to erase from Tufty)
+
+Alternatively, open Thonny, connect to the board, then browse to the 'state' directory and open the log files within Thonny. They're in the `state` directory at the root of the device's filesystem.
+
+TODO: Make `gps_log_clear.sh` script to clear the GPS log.
+
 ## Author
 
 Authored by [Jeff Geerling](https://www.jeffgeerling.com) in 2026, with help from Claude Sonnet 5 and Pimoroni's excellent forum users.

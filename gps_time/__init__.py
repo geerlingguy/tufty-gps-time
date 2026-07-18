@@ -63,10 +63,29 @@
 # GPS Info 1: fix status shown as NO FIX / 2D / 3D (from GSA mode2,
 # combined with the same fix-valid/timeout check as the top-left warning).
 # HDOP colour-coded green (<=2), orange (2-5), red (>5).
+#
+# Location logging: appends timestamp/lat/lon/fix quality/HDOP/sats in
+# use/altitude to a CSV. A reading is sampled every 5s
+# (GPS_LOG_SAMPLE_INTERVAL) into a RAM buffer, but that buffer is only
+# written to flash every 60s (GPS_LOG_WRITE_INTERVAL) as one batched write
+# - see _maybe_log_gps(). A new file is started fresh each power-on -
+# gps_log_0001.csv, gps_log_0002.csv, etc. (see _next_gps_log_path()) -
+# rather than one file capped/rotated over time, on the assumption the
+# badge gets powered off nightly. Written under GPS_LOG_DIR = "/state" -
+# per Pimoroni's forum-documented State API
+# (forums.pimoroni.com/t/is-the-tufty-file-system-really-read-only/28743/4),
+# an app's own /apps/<name> directory is not writable at runtime; /state is
+# the one location regular open()/write() calls are guaranteed to work
+# against. (Two earlier attempts - a relative filename, then a hardcoded
+# /apps/gps_time path - both silently failed against that read-only area.)
+# _go_home() also flushes any buffered-but-unwritten rows before
+# resetting, since that's the one "leaving the app" moment the code gets
+# to catch.
 
 import machine
 import time
 import math
+import os
 
 # Real backlight control - found via a Pimoroni forum post, not documented
 # in badge.md, so its exact value range/behaviour is unconfirmed. Guarded
@@ -82,12 +101,12 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Hours to add to UTC to get local time, e.g. -5 for US Central.
+# Hours to add to UTC to get local time, e.g. -7 for US Pacific (PDT).
 # Half-hour offsets (e.g. 5.5) are fine too. This is only the *startup
 # default* - it's adjustable at runtime from the Settings screen (see
 # local_offset below), and resets back to this value on every boot rather
 # than persisting, since there's no flash/EEPROM storage wired up for it.
-LOCAL_OFFSET = -5
+LOCAL_OFFSET = -7
 
 # Displayed just above the UTC clock, same size as the local time line.
 OWNER_NAME = "Jeff Geerling"
@@ -154,6 +173,28 @@ GPS_I2C_ADDR = 0x10
 # Addresses cycled through by the Settings screen's "GPS I2C Address"
 # field: PA1010D (0x10), then u-blox (0x42 - MAX-M10S and similar).
 _GPS_I2C_ADDR_CHOICES = (0x10, 0x42)
+
+# Location logging: appends a row of lat/lon/fix/HDOP/sats/altitude to a
+# CSV file. Sampling and writing are decoupled: a GPS reading is taken
+# every GPS_LOG_SAMPLE_INTERVAL seconds and held in RAM, but rows are only
+# flushed to flash every GPS_LOG_WRITE_INTERVAL seconds (as one batched
+# write of everything sampled since the last flush) - this keeps the log's
+# time resolution fine while writing to flash far less often. A fresh file
+# is started each time the badge powers on (see _next_gps_log_path())
+# rather than one ever-growing log, so a day's outing is its own file -
+# GPS_LOG_PREFIX/GPS_LOG_SUFFIX name each one gps_log_0001.csv,
+# gps_log_0002.csv, etc., picking up wherever the highest existing number
+# left off. GPS_LOG_DIR is "/state" - the Tufty's app data directories
+# (e.g. /apps/gps_time, where this file lives) aren't writable at runtime;
+# /state is the documented writable area for exactly this kind of thing
+# (see forums.pimoroni.com/t/is-the-tufty-file-system-really-read-only/
+# 28743/4). Two earlier attempts here - a relative filename, then a
+# hardcoded /apps/gps_time path - both silently failed for that reason.
+GPS_LOG_DIR = "/state"
+GPS_LOG_PREFIX = "gps_log_"
+GPS_LOG_SUFFIX = ".csv"
+GPS_LOG_SAMPLE_INTERVAL = 5   # seconds between readings taken (in RAM)
+GPS_LOG_WRITE_INTERVAL = 60   # seconds between batched writes to flash
 
 # QWIIC/I2C bus setup. Pimoroni's most common Qw/ST pin mapping is GP4/GP5,
 # but this isn't documented for Tufty 2350 specifically - if the GPS never
@@ -260,6 +301,16 @@ _i2c_consecutive_errors = 0
 _i2c_last_recover_ticks = None
 _i2c_recover_count = 0
 
+# Location logging state. _gps_log_path is decided once at boot (see
+# _init_gps_log()/_next_gps_log_path()) and used for every row this
+# session - there's no cap to track since each power-on gets its own file.
+# _gps_log_buffer holds sampled-but-not-yet-written rows (see
+# GPS_LOG_SAMPLE_INTERVAL vs GPS_LOG_WRITE_INTERVAL above).
+_gps_log_path = None
+_gps_log_buffer = []
+_gps_last_sample_ticks = None
+_gps_last_write_ticks = None
+
 # Simple non-blocking fade envelope: hold at full brightness for
 # _led_hold_ms, then linearly fade to off over _led_fade_ms. Both a quick
 # sync blink and the longer fix-acquired flash use this same mechanism,
@@ -301,8 +352,9 @@ _screen = "clock"
 local_offset = LOCAL_OFFSET  # hours added to UTC for local time display
 time_format_24h = False       # False = 12H with AM/PM, True = 24H
 gps_i2c_addr = GPS_I2C_ADDR   # which GPS module address _poll_gps()/_configure_gps_for_address() talk to
+gps_logging_enabled = True    # whether _maybe_log_gps() samples/writes rows at all
 
-_SETTINGS_FIELD_COUNT = 3
+_SETTINGS_FIELD_COUNT = 4
 _settings_selected_index = 0  # which field UP/DOWN currently adjusts
 
 # Debug/diagnostic counters - shown on screen since Thonny's console won't
@@ -921,6 +973,142 @@ def _maybe_sync_rtc():
         _sync_rtc_now()
 
 
+def _fix_quality_label(fix_type):
+    """Maps gps_fix_type (GSA mode2: 1=no fix, 2=2D, 3=3D) to the short
+    string used in the CSV log - same 2D/3D/NO vocabulary as the on-screen
+    fix status elsewhere in the app."""
+    if fix_type == 3:
+        return "3D"
+    if fix_type == 2:
+        return "2D"
+    return "NO"
+
+
+def _next_gps_log_path():
+    """Scans GPS_LOG_DIR (the writable /state area) for existing
+    gps_log_NNNN.csv files, and returns the full path for the next one in
+    sequence (highest existing index + 1, or 0001 if none exist yet). This
+    is what gives each power-on its own fresh file."""
+    max_index = 0
+    try:
+        for name in os.listdir(GPS_LOG_DIR):
+            if name.startswith(GPS_LOG_PREFIX) and name.endswith(GPS_LOG_SUFFIX):
+                middle = name[len(GPS_LOG_PREFIX):-len(GPS_LOG_SUFFIX)]
+                try:
+                    idx = int(middle)
+                    if idx > max_index:
+                        max_index = idx
+                except ValueError:
+                    continue
+    except OSError as e:
+        print("gps_time: couldn't list", GPS_LOG_DIR, "for existing logs:", e)
+
+    return "{}/{}{:04d}{}".format(GPS_LOG_DIR, GPS_LOG_PREFIX, max_index + 1, GPS_LOG_SUFFIX)
+
+
+def _init_gps_log():
+    """Called once from init(). Picks a fresh, uniquely-numbered CSV path
+    for this session, writes its header row, and starts the sample/write
+    timers from this moment so the first sample/flush land a full interval
+    after boot rather than immediately.
+
+    Also prints os.getcwd() - purely diagnostic, left in so a future path
+    problem (like this one) shows up immediately in the console rather
+    than needing to be re-discovered by trial and error."""
+    global _gps_log_path, _gps_last_sample_ticks, _gps_last_write_ticks
+
+    try:
+        print("gps_time: cwd at boot:", os.getcwd())
+    except Exception as e:
+        print("gps_time: couldn't read cwd:", e)
+
+    _gps_log_path = _next_gps_log_path()
+    try:
+        with open(_gps_log_path, "w") as f:
+            f.write("timestamp,latitude,longitude,fix_quality,hdop,sats_in_use,altitude\n")
+        print("gps_time: logging location to", _gps_log_path)
+    except OSError as e:
+        print("gps_time: failed to create", _gps_log_path, "-", e)
+        _gps_log_path = None
+
+    _gps_last_sample_ticks = badge.ticks
+    _gps_last_write_ticks = badge.ticks
+
+
+def _format_log_timestamp():
+    """UTC timestamp for the log row, from whichever source the clock
+    display itself is currently trusting (RTC if available/plausible, else
+    last known GPS time) - so log timestamps stay sane even between fixes.
+    Empty string if neither is available yet (e.g. no fix since boot)."""
+    dt = _get_display_datetime()
+    if dt is None:
+        return ""
+    year, month, day, hour, minute, second = dt[0], dt[1], dt[2], dt[3], dt[4], dt[5]
+    return "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}Z".format(year, month, day, hour, minute, second)
+
+
+def _sample_gps_fix():
+    """Builds one CSV row from the current GPS state and appends it to
+    _gps_log_buffer (RAM only - see _flush_gps_log() for the actual write).
+    Fields are blank (not zero) when unknown, e.g. no fix yet, so they're
+    not mistaken for real readings of 0.0."""
+    timestamp = _format_log_timestamp()
+    lat = "" if gps_lat is None else "{:.6f}".format(gps_lat)
+    lon = "" if gps_lon is None else "{:.6f}".format(gps_lon)
+    fix_quality = _fix_quality_label(gps_fix_type)
+    hdop = "" if gps_hdop is None else "{:.1f}".format(gps_hdop)
+    altitude = "" if gps_altitude is None else "{:.1f}".format(gps_altitude)
+
+    _gps_log_buffer.append("{},{},{},{},{},{},{}\n".format(
+        timestamp, lat, lon, fix_quality, hdop, gps_num_sats, altitude))
+
+
+def _flush_gps_log():
+    """Writes every row currently in _gps_log_buffer to disk in one go,
+    then clears the buffer. A single open/write/close for the whole batch,
+    rather than one per row, is what actually cuts down on flash writes -
+    sampling into RAM alone wouldn't save anything if each sample still hit
+    flash individually."""
+    global _gps_log_buffer
+
+    if _gps_log_path is None or not _gps_log_buffer:
+        return
+
+    try:
+        with open(_gps_log_path, "a") as f:
+            for row in _gps_log_buffer:
+                f.write(row)
+        _gps_log_buffer = []
+    except OSError as e:
+        print("gps_time: failed to flush location log:", e)
+
+
+def _maybe_log_gps():
+    """Called every update() frame. Takes a GPS reading into RAM every
+    GPS_LOG_SAMPLE_INTERVAL seconds, and separately flushes everything
+    buffered to flash every GPS_LOG_WRITE_INTERVAL seconds - the two
+    timers are independent, so a sample and a flush can land in the same
+    frame or several frames apart. Does nothing at all while
+    gps_logging_enabled is False (Settings screen) - the sample/write
+    timers just sit frozen at whatever they last were, so toggling this
+    back on resumes into the same per-boot log file rather than starting
+    a new one."""
+    global _gps_last_sample_ticks, _gps_last_write_ticks
+
+    if not gps_logging_enabled:
+        return
+
+    now = badge.ticks
+
+    if _gps_last_sample_ticks is None or (now - _gps_last_sample_ticks) >= GPS_LOG_SAMPLE_INTERVAL * 1000:
+        _gps_last_sample_ticks = now
+        _sample_gps_fix()
+
+    if _gps_last_write_ticks is None or (now - _gps_last_write_ticks) >= GPS_LOG_WRITE_INTERVAL * 1000:
+        _gps_last_write_ticks = now
+        _flush_gps_log()
+
+
 def _i2c_recover():
     """Attempt to un-wedge the I2C bus and reinitialise the GPS connection.
 
@@ -1167,6 +1355,8 @@ def init():
     _load_cog_image()
     _load_home_image()
 
+    _init_gps_log()
+
 
 _ARROW_W = 10
 _ARROW_H = 7
@@ -1333,8 +1523,14 @@ def _go_home():
     hand-off - expect a brief reboot flicker, not an instant transition.
     I can't fully rule out this having its own surprises without testing
     on real hardware, but it's the more standard, lower-risk tool of the
-    two for this job."""
+    two for this job.
+
+    Also flushes the location log buffer first - a reset here is the one
+    "leaving the app" path we get to intercept before a real power-off,
+    so it's a free chance to save any samples taken since the last
+    scheduled GPS_LOG_WRITE_INTERVAL flush rather than losing them."""
     _sync_rtc_now()
+    _flush_gps_log()
     machine.reset()
 
 
@@ -1770,8 +1966,11 @@ def _adjust_selected_setting(direction):
     clamped to the real-world UTC offset range. Time format just flips
     between its two states. GPS I2C address cycles _GPS_I2C_ADDR_CHOICES
     and calls _configure_gps_for_address() to reconfigure the module at
-    the new address."""
-    global local_offset, time_format_24h, gps_i2c_addr
+    the new address. GPS Logging just flips on/off - see _maybe_log_gps()
+    for how it's checked; toggling it doesn't start a new log file or
+    touch what's already been written, it just pauses/resumes sampling
+    into the existing session's file."""
+    global local_offset, time_format_24h, gps_i2c_addr, gps_logging_enabled
 
     if _settings_selected_index == 0:
         local_offset += 0.5 * direction
@@ -1781,11 +1980,13 @@ def _adjust_selected_setting(direction):
             local_offset = MIN_LOCAL_OFFSET
     elif _settings_selected_index == 1:
         time_format_24h = not time_format_24h
-    else:
+    elif _settings_selected_index == 2:
         idx = _GPS_I2C_ADDR_CHOICES.index(gps_i2c_addr)
         idx = (idx + direction) % len(_GPS_I2C_ADDR_CHOICES)
         gps_i2c_addr = _GPS_I2C_ADDR_CHOICES[idx]
         _configure_gps_for_address()
+    else:
+        gps_logging_enabled = not gps_logging_enabled
 
 
 def _draw_settings_screen():
@@ -1808,11 +2009,13 @@ def _draw_settings_screen():
     offset_str = "{:+.1f}h".format(local_offset)
     format_str = "24H" if time_format_24h else "12H"
     addr_str = "0x{:02X}".format(gps_i2c_addr)
+    logging_str = "ON" if gps_logging_enabled else "OFF"
 
     rows = [
         ("Local UTC offset", offset_str),
         ("Time format", format_str),
         ("GPS I2C Address", addr_str),
+        ("GPS Logging", logging_str),
     ]
 
     for i, (label, value) in enumerate(rows):
@@ -1841,6 +2044,7 @@ def update():
     _poll_gps()
     _update_fix_status()
     _maybe_sync_rtc()
+    _maybe_log_gps()
     _update_leds()
     _update_ambient_dimming()
     _apply_ambient_level()
