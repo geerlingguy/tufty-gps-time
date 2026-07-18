@@ -71,11 +71,16 @@
 # - see _maybe_log_gps(). A new file is started fresh each power-on -
 # gps_log_0001.csv, gps_log_0002.csv, etc. (see _next_gps_log_path()) -
 # rather than one file capped/rotated over time, on the assumption the
-# badge gets powered off nightly. Files are relative paths (no leading
-# "/"), same as cog.png/home.png below, so they land in this app's own
-# directory rather than the filesystem root. _go_home() also flushes any
-# buffered-but-unwritten rows before resetting, since that's the one
-# "leaving the app" moment the code gets to catch.
+# badge gets powered off nightly. Written under GPS_LOG_DIR = "/state" -
+# per Pimoroni's forum-documented State API
+# (forums.pimoroni.com/t/is-the-tufty-file-system-really-read-only/28743/4),
+# an app's own /apps/<name> directory is not writable at runtime; /state is
+# the one location regular open()/write() calls are guaranteed to work
+# against. (Two earlier attempts - a relative filename, then a hardcoded
+# /apps/gps_time path - both silently failed against that read-only area.)
+# _go_home() also flushes any buffered-but-unwritten rows before
+# resetting, since that's the one "leaving the app" moment the code gets
+# to catch.
 
 import machine
 import time
@@ -96,12 +101,12 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Hours to add to UTC to get local time, e.g. -5 for US Central.
+# Hours to add to UTC to get local time, e.g. -7 for US Pacific (PDT).
 # Half-hour offsets (e.g. 5.5) are fine too. This is only the *startup
 # default* - it's adjustable at runtime from the Settings screen (see
 # local_offset below), and resets back to this value on every boot rather
 # than persisting, since there's no flash/EEPROM storage wired up for it.
-LOCAL_OFFSET = -5
+LOCAL_OFFSET = -7
 
 # Displayed just above the UTC clock, same size as the local time line.
 OWNER_NAME = "Jeff Geerling"
@@ -179,7 +184,13 @@ _GPS_I2C_ADDR_CHOICES = (0x10, 0x42)
 # rather than one ever-growing log, so a day's outing is its own file -
 # GPS_LOG_PREFIX/GPS_LOG_SUFFIX name each one gps_log_0001.csv,
 # gps_log_0002.csv, etc., picking up wherever the highest existing number
-# left off.
+# left off. GPS_LOG_DIR is "/state" - the Tufty's app data directories
+# (e.g. /apps/gps_time, where this file lives) aren't writable at runtime;
+# /state is the documented writable area for exactly this kind of thing
+# (see forums.pimoroni.com/t/is-the-tufty-file-system-really-read-only/
+# 28743/4). Two earlier attempts here - a relative filename, then a
+# hardcoded /apps/gps_time path - both silently failed for that reason.
+GPS_LOG_DIR = "/state"
 GPS_LOG_PREFIX = "gps_log_"
 GPS_LOG_SUFFIX = ".csv"
 GPS_LOG_SAMPLE_INTERVAL = 5   # seconds between readings taken (in RAM)
@@ -341,8 +352,9 @@ _screen = "clock"
 local_offset = LOCAL_OFFSET  # hours added to UTC for local time display
 time_format_24h = False       # False = 12H with AM/PM, True = 24H
 gps_i2c_addr = GPS_I2C_ADDR   # which GPS module address _poll_gps()/_configure_gps_for_address() talk to
+gps_logging_enabled = True    # whether _maybe_log_gps() samples/writes rows at all
 
-_SETTINGS_FIELD_COUNT = 3
+_SETTINGS_FIELD_COUNT = 4
 _settings_selected_index = 0  # which field UP/DOWN currently adjusts
 
 # Debug/diagnostic counters - shown on screen since Thonny's console won't
@@ -973,14 +985,13 @@ def _fix_quality_label(fix_type):
 
 
 def _next_gps_log_path():
-    """Scans this app's own directory (the current working directory the
-    badge loader runs it from - same place cog.png/home.png are loaded
-    from) for existing gps_log_NNNN.csv files, and returns the path for
-    the next one in sequence (highest existing index + 1, or 0001 if none
-    exist yet). This is what gives each power-on its own fresh file."""
+    """Scans GPS_LOG_DIR (the writable /state area) for existing
+    gps_log_NNNN.csv files, and returns the full path for the next one in
+    sequence (highest existing index + 1, or 0001 if none exist yet). This
+    is what gives each power-on its own fresh file."""
     max_index = 0
     try:
-        for name in os.listdir("."):
+        for name in os.listdir(GPS_LOG_DIR):
             if name.startswith(GPS_LOG_PREFIX) and name.endswith(GPS_LOG_SUFFIX):
                 middle = name[len(GPS_LOG_PREFIX):-len(GPS_LOG_SUFFIX)]
                 try:
@@ -990,17 +1001,26 @@ def _next_gps_log_path():
                 except ValueError:
                     continue
     except OSError as e:
-        print("gps_time: couldn't list app directory for existing logs:", e)
+        print("gps_time: couldn't list", GPS_LOG_DIR, "for existing logs:", e)
 
-    return "{}{:04d}{}".format(GPS_LOG_PREFIX, max_index + 1, GPS_LOG_SUFFIX)
+    return "{}/{}{:04d}{}".format(GPS_LOG_DIR, GPS_LOG_PREFIX, max_index + 1, GPS_LOG_SUFFIX)
 
 
 def _init_gps_log():
     """Called once from init(). Picks a fresh, uniquely-numbered CSV path
     for this session, writes its header row, and starts the sample/write
     timers from this moment so the first sample/flush land a full interval
-    after boot rather than immediately."""
+    after boot rather than immediately.
+
+    Also prints os.getcwd() - purely diagnostic, left in so a future path
+    problem (like this one) shows up immediately in the console rather
+    than needing to be re-discovered by trial and error."""
     global _gps_log_path, _gps_last_sample_ticks, _gps_last_write_ticks
+
+    try:
+        print("gps_time: cwd at boot:", os.getcwd())
+    except Exception as e:
+        print("gps_time: couldn't read cwd:", e)
 
     _gps_log_path = _next_gps_log_path()
     try:
@@ -1068,8 +1088,15 @@ def _maybe_log_gps():
     GPS_LOG_SAMPLE_INTERVAL seconds, and separately flushes everything
     buffered to flash every GPS_LOG_WRITE_INTERVAL seconds - the two
     timers are independent, so a sample and a flush can land in the same
-    frame or several frames apart."""
+    frame or several frames apart. Does nothing at all while
+    gps_logging_enabled is False (Settings screen) - the sample/write
+    timers just sit frozen at whatever they last were, so toggling this
+    back on resumes into the same per-boot log file rather than starting
+    a new one."""
     global _gps_last_sample_ticks, _gps_last_write_ticks
+
+    if not gps_logging_enabled:
+        return
 
     now = badge.ticks
 
@@ -1939,8 +1966,11 @@ def _adjust_selected_setting(direction):
     clamped to the real-world UTC offset range. Time format just flips
     between its two states. GPS I2C address cycles _GPS_I2C_ADDR_CHOICES
     and calls _configure_gps_for_address() to reconfigure the module at
-    the new address."""
-    global local_offset, time_format_24h, gps_i2c_addr
+    the new address. GPS Logging just flips on/off - see _maybe_log_gps()
+    for how it's checked; toggling it doesn't start a new log file or
+    touch what's already been written, it just pauses/resumes sampling
+    into the existing session's file."""
+    global local_offset, time_format_24h, gps_i2c_addr, gps_logging_enabled
 
     if _settings_selected_index == 0:
         local_offset += 0.5 * direction
@@ -1950,11 +1980,13 @@ def _adjust_selected_setting(direction):
             local_offset = MIN_LOCAL_OFFSET
     elif _settings_selected_index == 1:
         time_format_24h = not time_format_24h
-    else:
+    elif _settings_selected_index == 2:
         idx = _GPS_I2C_ADDR_CHOICES.index(gps_i2c_addr)
         idx = (idx + direction) % len(_GPS_I2C_ADDR_CHOICES)
         gps_i2c_addr = _GPS_I2C_ADDR_CHOICES[idx]
         _configure_gps_for_address()
+    else:
+        gps_logging_enabled = not gps_logging_enabled
 
 
 def _draw_settings_screen():
@@ -1977,11 +2009,13 @@ def _draw_settings_screen():
     offset_str = "{:+.1f}h".format(local_offset)
     format_str = "24H" if time_format_24h else "12H"
     addr_str = "0x{:02X}".format(gps_i2c_addr)
+    logging_str = "ON" if gps_logging_enabled else "OFF"
 
     rows = [
         ("Local UTC offset", offset_str),
         ("Time format", format_str),
         ("GPS I2C Address", addr_str),
+        ("GPS Logging", logging_str),
     ]
 
     for i, (label, value) in enumerate(rows):
