@@ -144,8 +144,17 @@
       <select id="metric-select">
         <option value="hdop">Color by HDOP</option>
         <option value="sats">Color by satellites</option>
+        <option value="combined" selected>Color by HDOP + sats</option>
         <option value="fix">Color by fix type</option>
       </select>
+      <select id="view-select">
+        <option value="points">View: Points</option>
+        <option value="heatmap">View: Heatmap</option>
+      </select>
+      <label class="btn" id="opacity-control" style="display:none; cursor:default; gap:8px;">
+        <span style="color: var(--text-dim); font-size:11px;">Opacity</span>
+        <input type="range" id="opacity-slider" min="10" max="100" value="72" style="accent-color: var(--accent); cursor:pointer;">
+      </label>
       <button class="btn" id="fit-btn">Fit to track</button>
     </div>
   </header>
@@ -240,16 +249,29 @@ function colorForT(t) {
   return `rgb(${r},${g},${b})`;
 }
 
+const _hdopT = (p) => clamp01(((p.hdop ?? 5) - 0.8) / (5.0 - 0.8));
+const _satsT = (p) => clamp01((10 - (p.sats ?? 3)) / (10 - 3));
+
 const METRICS = {
   hdop: {
     label: 'HDOP (lower = better)',
     minLabel: '0.8', maxLabel: '5.0+',
-    t: (p) => clamp01(((p.hdop ?? 5) - 0.8) / (5.0 - 0.8)),
+    t: _hdopT,
   },
   sats: {
     label: 'Satellites in use',
     minLabel: '10+', maxLabel: '3',
-    t: (p) => clamp01((10 - (p.sats ?? 3)) / (10 - 3)),
+    t: _satsT,
+  },
+  combined: {
+    // HDOP already reflects satellite geometry, so it's weighted higher;
+    // raw satellite count is folded in too since a fix built from very
+    // few satellites is less trustworthy than one built from many, even
+    // at the same HDOP - a low-sat fix has less redundancy to catch a
+    // single bad measurement.
+    label: 'HDOP + satellites (good \u2192 poor)',
+    minLabel: 'good', maxLabel: 'poor',
+    t: (p) => clamp01(0.65 * _hdopT(p) + 0.35 * _satsT(p)),
   },
   fix: {
     label: 'Fix type',
@@ -276,27 +298,38 @@ function fmtDuration(ms) {
 }
 
 // ---------- App state ----------
-let map, layerGroup, currentMetric = 'hdop';
+let map, layerGroup, heatLayer, currentMetric = 'combined', currentView = 'points', heatOpacity = 0.72;
 const tooltip = document.getElementById('tooltip');
 const emptyState = document.getElementById('empty-state');
 
 function initMap() {
-  map = L.map('map', { zoomControl: true, attributionControl: true, preferCanvas: true }).setView([37.5479, -122.3019], 17);
+  map = L.map('map', { zoomControl: true, attributionControl: true, preferCanvas: true, maxZoom: 21 }).setView([37.5479, -122.3019], 17);
 
+  // maxZoom here is how far the *map* lets you zoom; maxNativeZoom is the
+  // deepest zoom the tile provider actually has imagery for. Without
+  // maxNativeZoom, zooming past a provider's real max makes Leaflet
+  // request tiles that don't exist - which come back empty and show the
+  // dark page background through them (looks like the map "turned
+  // black"). Setting maxNativeZoom instead makes it stretch the deepest
+  // real tile to fill in past that point, which stays blurry but never
+  // goes blank.
   const streets = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 20,
+    maxZoom: 21,
+    maxNativeZoom: 19,
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
   });
 
   const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-    maxZoom: 19,
+    maxZoom: 21,
+    maxNativeZoom: 19,
     attribution: 'Imagery &copy; Esri &mdash; Esri, Maxar, Earthstar Geographics',
   });
 
   // Street names/labels drawn on top of the satellite imagery, since raw
   // satellite tiles have no text of their own.
   const satelliteLabels = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
-    maxZoom: 19,
+    maxZoom: 21,
+    maxNativeZoom: 19,
     pane: 'shadowPane', // renders above tiles, below markers
   });
 
@@ -319,6 +352,7 @@ function initMap() {
 function render(points) {
   const fixes = usableFixes(points);
   layerGroup.clearLayers();
+  if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
 
   document.getElementById('stat-total').textContent = points.length;
   document.getElementById('stat-fixed').textContent = fixes.length;
@@ -337,7 +371,8 @@ function render(points) {
   document.getElementById('stat-sats').textContent = medSats !== null ? medSats.toFixed(0) : '–';
 
   const metric = METRICS[currentMetric];
-  document.getElementById('legend-title').textContent = metric.label;
+  document.getElementById('legend-title').textContent =
+    metric.label + (currentView === 'heatmap' ? ' — heat = poor signal' : '');
   document.getElementById('legend-min').textContent = metric.minLabel;
   document.getElementById('legend-max').textContent = metric.maxLabel;
 
@@ -347,6 +382,17 @@ function render(points) {
   }
   emptyState.classList.add('hidden');
 
+  if (currentView === 'heatmap') {
+    renderHeatmap(fixes, metric);
+  } else {
+    renderPoints(fixes, metric);
+  }
+
+  const latlngs = fixes.map(p => [p.lat, p.lon]);
+  map.fitBounds(L.latLngBounds(latlngs), { padding: [40, 40] });
+}
+
+function renderPoints(fixes, metric) {
   // Faint connecting line to show the walked path
   const latlngs = fixes.map(p => [p.lat, p.lon]);
   L.polyline(latlngs, { color: '#4d9fff', weight: 2, opacity: 0.25 }).addTo(layerGroup);
@@ -381,8 +427,179 @@ function render(points) {
     });
     marker.on('mouseout', () => { tooltip.style.display = 'none'; });
   });
+}
 
-  map.fitBounds(L.latLngBounds(latlngs), { padding: [40, 40] });
+// Bins fixes into roughly-square grid cells (~cellMeters across) and
+// returns one entry per occupied cell: its center and the *average*
+// badness of every fix that landed in it. This is mainly a performance
+// step for QualityHeatLayer below (fewer input points for dense logs);
+// see that layer's comment for why *averaging* rather than *summing*
+// nearby readings is what actually fixes the red-saturation problem.
+function aggregateToGrid(fixes, metric, cellMeters) {
+  const lat0 = fixes.reduce((s, p) => s + p.lat, 0) / fixes.length;
+  const cellLat = cellMeters / 111320;
+  const cellLon = cellMeters / (111320 * Math.cos(lat0 * Math.PI / 180));
+
+  const cells = new Map();
+  fixes.forEach(p => {
+    const row = Math.round(p.lat / cellLat);
+    const col = Math.round(p.lon / cellLon);
+    const key = row + '_' + col;
+    let cell = cells.get(key);
+    if (!cell) {
+      cell = { latSum: 0, lonSum: 0, tSum: 0, count: 0 };
+      cells.set(key, cell);
+    }
+    cell.latSum += p.lat;
+    cell.lonSum += p.lon;
+    cell.tSum += metric.t(p);
+    cell.count += 1;
+  });
+
+  return Array.from(cells.values()).map(c => ({
+    lat: c.latSum / c.count,
+    lon: c.lonSum / c.count,
+    avgT: c.tSum / c.count,
+    count: c.count,
+  }));
+}
+
+// A "quality" heatmap: at every pixel, take a Gaussian-weighted AVERAGE of
+// nearby cells' badness (0=good, 1=poor) and color that average directly.
+// This is deliberately not a density heatmap (like leaflet.heat, which
+// sums nearby intensities) - summing means a cluster of samples in a
+// good-signal spot you lingered near can out-accumulate a sparser cluster
+// of genuinely bad readings and paint the good spot red anyway. Averaging
+// can't saturate that way: a pixel surrounded only by green cells always
+// averages to green, no matter how many of them there are.
+const QualityHeatLayer = L.Layer.extend({
+  initialize: function (cells, options) {
+    this._cells = cells; // [{lat, lon, avgT}]
+    L.setOptions(this, options);
+  },
+
+  onAdd: function (map) {
+    this._map = map;
+    this._canvas = L.DomUtil.create('canvas', 'quality-heat-canvas');
+    this._canvas.style.position = 'absolute';
+    this._canvas.style.pointerEvents = 'none';
+    // Cheap smoothing over the render grid's stepped edges - much
+    // cheaper than shrinking the step size further to get the same effect.
+    this._canvas.style.filter = 'blur(2px)';
+    map.getPanes().overlayPane.appendChild(this._canvas);
+    map.on('moveend zoomend resize', this._reset, this);
+    this._canvas.style.opacity = this.options.opacity ?? 0.72;
+    this._reset();
+    return this;
+  },
+
+  // Cheap live update for a slider: just adjusts CSS opacity on the
+  // already-rendered canvas, no recompute of the underlying raster.
+  setOpacity: function (opacity) {
+    this.options.opacity = opacity;
+    if (this._canvas) this._canvas.style.opacity = opacity;
+    return this;
+  },
+
+  onRemove: function (map) {
+    L.DomUtil.remove(this._canvas);
+    map.off('moveend zoomend resize', this._reset, this);
+  },
+
+  _reset: function () {
+    const topLeft = this._map.containerPointToLayerPoint([0, 0]);
+    L.DomUtil.setPosition(this._canvas, topLeft);
+    const size = this._map.getSize();
+    this._canvas.width = size.x;
+    this._canvas.height = size.y;
+    this._draw();
+  },
+
+  _draw: function () {
+    const ctx = this._canvas.getContext('2d');
+    const w = this._canvas.width, h = this._canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    if (!this._cells.length || w <= 0 || h <= 0) return;
+
+    // Blend radius is defined in real-world METERS, not screen pixels, so
+    // it stays a consistent "how far does one reading's influence reach"
+    // at every zoom level - this is what stops zooming in from smearing
+    // dense coverage into one giant blob: the blend radius shrinks in
+    // screen-pixel terms right along with it, at the same rate real
+    // inter-point spacing grows on screen.
+    const sigmaMeters = this.options.sigmaMeters || 3.2;
+    const metersPerPixel = 156543.03392 * Math.cos(this._map.getCenter().lat * Math.PI / 180) / Math.pow(2, this._map.getZoom());
+    const sigma = Math.min(60, Math.max(6, sigmaMeters / metersPerPixel));
+    const step = this.options.gridStep || 3;      // px - render resolution (coarser = faster)
+    const maxDist = sigma * 2.2;
+    const twoSigma2 = 2 * sigma * sigma;
+
+    // Project data cells to screen space, bucketed by a grid sized to
+    // maxDist so we only ever have to check a point's own bucket + the 8
+    // neighbors, instead of every cell for every pixel.
+    const bucketSize = maxDist;
+    const buckets = new Map();
+    for (const c of this._cells) {
+      const pt = this._map.latLngToContainerPoint([c.lat, c.lon]);
+      if (pt.x < -bucketSize || pt.y < -bucketSize || pt.x > w + bucketSize || pt.y > h + bucketSize) continue;
+      const bx = Math.floor(pt.x / bucketSize), by = Math.floor(pt.y / bucketSize);
+      const key = bx + '_' + by;
+      let arr = buckets.get(key);
+      if (!arr) { arr = []; buckets.set(key, arr); }
+      arr.push({ x: pt.x, y: pt.y, t: c.avgT });
+    }
+    if (!buckets.size) return;
+
+    const img = ctx.createImageData(w, h);
+    const data = img.data;
+    const maxDist2 = maxDist * maxDist;
+
+    for (let gy = 0; gy < h; gy += step) {
+      const by0 = Math.floor(gy / bucketSize);
+      for (let gx = 0; gx < w; gx += step) {
+        const bx0 = Math.floor(gx / bucketSize);
+        let wsum = 0, tsum = 0;
+        for (let dbx = -1; dbx <= 1; dbx++) {
+          for (let dby = -1; dby <= 1; dby++) {
+            const arr = buckets.get((bx0 + dbx) + '_' + (by0 + dby));
+            if (!arr) continue;
+            for (let i = 0; i < arr.length; i++) {
+              const p = arr[i];
+              const ddx = p.x - gx, ddy = p.y - gy;
+              const d2 = ddx * ddx + ddy * ddy;
+              if (d2 > maxDist2) continue;
+              const wgt = Math.exp(-d2 / twoSigma2);
+              wsum += wgt;
+              tsum += wgt * p.t;
+            }
+          }
+        }
+        if (wsum < 0.02) continue; // no meaningful nearby data - stay transparent
+
+        const avg = clamp01(tsum / wsum);
+        const [r, g, b] = colorForT(avg).match(/\d+/g).map(Number);
+        // Ramp alpha in over the first bit of weight so isolated points
+        // don't look like hard-edged discs, then hold steady. Overall
+        // opacity is applied separately via CSS (see setOpacity) so the
+        // slider doesn't need to re-run this whole computation.
+        const alpha = Math.round(Math.min(1, wsum / 0.5) * 255);
+
+        const xEnd = Math.min(gx + step, w), yEnd = Math.min(gy + step, h);
+        for (let yy = gy; yy < yEnd; yy++) {
+          let idx = (yy * w + gx) * 4;
+          for (let xx = gx; xx < xEnd; xx++, idx += 4) {
+            data[idx] = r; data[idx + 1] = g; data[idx + 2] = b; data[idx + 3] = alpha;
+          }
+        }
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  },
+});
+
+function renderHeatmap(fixes, metric) {
+  const cells = aggregateToGrid(fixes, metric, 3); // ~3m cells
+  heatLayer = new QualityHeatLayer(cells.map(c => ({ lat: c.lat, lon: c.lon, avgT: c.avgT })), { opacity: heatOpacity }).addTo(map);
 }
 
 let currentPoints = [];
@@ -398,6 +615,20 @@ function loadCSVText(text, name) {
 document.getElementById('metric-select').addEventListener('change', (e) => {
   currentMetric = e.target.value;
   render(currentPoints);
+});
+
+const opacityControl = document.getElementById('opacity-control');
+const opacitySlider = document.getElementById('opacity-slider');
+
+document.getElementById('view-select').addEventListener('change', (e) => {
+  currentView = e.target.value;
+  opacityControl.style.display = currentView === 'heatmap' ? 'flex' : 'none';
+  render(currentPoints);
+});
+
+opacitySlider.addEventListener('input', (e) => {
+  heatOpacity = e.target.value / 100;
+  if (heatLayer) heatLayer.setOpacity(heatOpacity);
 });
 
 document.getElementById('fit-btn').addEventListener('click', () => {
