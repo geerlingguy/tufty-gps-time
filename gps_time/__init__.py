@@ -235,8 +235,17 @@ gps_hdop = None               # horizontal dilution of precision, from GGA
 gps_altitude = None           # metres above sea level, from GGA
 gps_fix_quality = 0           # GGA fix quality: 0=none, 1=GPS, 2=DGPS, ...
 gps_fix_type = 1              # GSA mode2: 1=no fix, 2=2D fix, 3=3D fix
-gps_lat = None                 # decimal degrees, +N/-S, from RMC
-gps_lon = None                 # decimal degrees, +E/-W, from RMC
+gps_lat = None                 # decimal degrees, +N/-S, best of GGA/RMC (see gps_lat/lon note below)
+gps_lon = None                 # decimal degrees, +E/-W, best of GGA/RMC
+
+# Some MTK-based receivers (incl. the PA1010D) emit lat/lon with more
+# fractional digits in one sentence type than the other - which one varies
+# by firmware, so rather than hardcoding a choice, _handle_nmea_sentence()
+# parses lat/lon from *both* GGA and RMC and keeps whichever raw NMEA
+# field string had more digits after the decimal point. This tracks the
+# digit count of whichever reading is currently stored in gps_lat/gps_lon,
+# so a later sentence only overwrites it if it's equal-or-more precise.
+_gps_coord_precision = -1
 
 # Per-satellite sky-plot data, from GSV:
 # {(talker, prn): (elevation_deg, azimuth_deg, snr, last_seen_ticks)}.
@@ -541,6 +550,16 @@ def _draw_battery_icon(x, y):
 # GPS / NMEA handling
 # ---------------------------------------------------------------------------
 
+def _coord_decimal_digits(value_str):
+    """Number of digits after the decimal point in a raw NMEA coordinate
+    field (e.g. "3732.8824" -> 4). Used to figure out, per-sentence, which
+    of GGA/RMC this receiver happens to report with more precision -
+    see the _gps_coord_precision note above gps_lat/gps_lon."""
+    if not value_str or "." not in value_str:
+        return 0
+    return len(value_str.split(".", 1)[1])
+
+
 def _parse_nmea_coord(value_str, hemisphere):
     """Converts an NMEA ddmm.mmmm / dddmm.mmmm coordinate field plus its
     hemisphere letter (N/S/E/W) into signed decimal degrees. Works for both
@@ -568,6 +587,7 @@ def _handle_nmea_sentence(line):
     global gps_num_sats, gps_fix_valid, gps_last_fix_ticks, gps_datetime
     global gga_count, rmc_count, gsa_count, last_nmea_line
     global gps_hdop, gps_altitude, gps_fix_quality, gps_fix_type, gps_lat, gps_lon
+    global _gps_coord_precision
     global gps_sats, gps_sats_used
     global _last_nmea_activity_ticks, _first_valid_fix_ticks
 
@@ -584,6 +604,15 @@ def _handle_nmea_sentence(line):
     if sentence_id.endswith("GGA"):
         gga_count += 1
         # $--GGA,time,lat,NS,lon,EW,fixquality,numSV,HDOP,alt,...
+        if len(fields) > 5 and fields[2] and fields[4]:
+            prec = min(_coord_decimal_digits(fields[2]), _coord_decimal_digits(fields[4]))
+            if prec >= _gps_coord_precision:
+                new_lat = _parse_nmea_coord(fields[2], fields[3])
+                new_lon = _parse_nmea_coord(fields[4], fields[5])
+                if new_lat is not None and new_lon is not None:
+                    gps_lat = new_lat
+                    gps_lon = new_lon
+                    _gps_coord_precision = prec
         if len(fields) > 6 and fields[6]:
             try:
                 gps_fix_quality = int(fields[6])
@@ -695,8 +724,14 @@ def _handle_nmea_sentence(line):
                         _first_valid_fix_ticks = badge.ticks
 
                     if len(fields) > 6:
-                        gps_lat = _parse_nmea_coord(fields[3], fields[4])
-                        gps_lon = _parse_nmea_coord(fields[5], fields[6])
+                        prec = min(_coord_decimal_digits(fields[3]), _coord_decimal_digits(fields[5]))
+                        if prec >= _gps_coord_precision:
+                            new_lat = _parse_nmea_coord(fields[3], fields[4])
+                            new_lon = _parse_nmea_coord(fields[5], fields[6])
+                            if new_lat is not None and new_lon is not None:
+                                gps_lat = new_lat
+                                gps_lon = new_lon
+                                _gps_coord_precision = prec
             except ValueError:
                 pass
 

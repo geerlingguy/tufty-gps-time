@@ -85,7 +85,17 @@ GPS Data Logging is enabled by default. You can disable it on the Settings scree
 
 Alternatively, open Thonny, connect to the board, then browse to the 'state' directory and open the log files within Thonny. They're in the `state` directory at the root of the device's filesystem.
 
-TODO: Make `gps_log_clear.sh` script to clear the GPS log.
+### GPS Log Visualization
+
+There is a tiny webapp you can run locally (single HTML file) to visualize the logged GPS data on a map, with color corresponding to signal quality.
+
+Open `gps_log_map.html` in your web browser, and click 'Load CSV', then select your CSV log file.
+
+If you need to aggregate multiple log files into one, run the following:
+
+```
+{ head -n 1 gps_log_0001.csv; for f in gps_log_*.csv; do tail -n +2 "$f"; done; } > combined_gps_log.csv
+```
 
 ## Author
 
