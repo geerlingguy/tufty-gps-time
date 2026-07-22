@@ -35,9 +35,11 @@ At this point, the GPS Time app should configure the MAX-M10S to send over NMEA 
 
 ### 3D Printed GPS bracket
 
-For best GPS reception, the patch antenna (the big ceramic thing on top of the GPS chip) should face the sky. So I've modified the official [Badgeware Multi-sensor Stick Clip](https://www.printables.com/model/1726590-badgeware-multi-sensor-stick-clip) design to hold the GPS module vertically, so it will be pointed 'up' while you're wearing the badge.
+<p align="center"><img src="images/tufty-2350-minigps-clip.jpg" width="550" height="auto"></p>
 
-TODO: See [Issue #3 - Design 3D printed 'GPS HAT' mount for PA1010D](https://github.com/geerlingguy/tufty-gps-time/issues/3).
+For best GPS reception, the patch antenna (the big ceramic thing on top of the GPS chip) should face the sky. I modified the official [Badgeware Multi-sensor Stick Clip](https://www.printables.com/model/1726590-badgeware-multi-sensor-stick-clip) design to hold the GPS module vertically, so it will be pointed 'up' while you're wearing the badge.
+
+The 3D design files are in the '3d mount' directory, but I've also published them on Printables: [Badgewear MiniGPS Clip](https://www.printables.com/model/1787732-badgeware-minigps-clip).
 
 Sources used for 3D modeling the bracket:
 
@@ -49,9 +51,7 @@ This bracket is also useful if you're debugging the badge or displaying it on yo
 
 ### PPS Output
 
-I would also like to have an SMA or BNC plug available for PPS output directly from the GPS module.
-
-TODO: Add method for PPS testing, maybe two-pin header with a female BNC or SMA connector soldered to a two-pin plug that goes into that header.
+You can solder two pins to the 'PPS' and 'GND' pins for PPS output, to allow 1 Hz external clock disciplining or GPS module comparison. Unfortunately, I could not find a way to route the PPS signal into the RP2350 using Tufty's PCB.
 
 ### PPS Input
 
