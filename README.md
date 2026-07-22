@@ -51,7 +51,7 @@ This bracket is also useful if you're debugging the badge or displaying it on yo
 
 ### PPS Output
 
-You can solder two pins to the 'PPS' and 'GND' pins for PPS output, to allow 1 Hz external clock disciplining or GPS module comparison. Unfortunately, I could not find a way to route the PPS signal into the RP2350 using Tufty's PCB.
+You can solder two pins to the 'PPS' and 'GND' pins for PPS output, to allow 1 Hz external clock disciplining or GPS module comparison. Unfortunately, there are [no GPIO pins exposed on Tufty's PCB](https://forums.pimoroni.com/t/pps-input-on-tufty-gpio-pin/28958) for the RP2350 to ingest a PPS signal.
 
 ### PPS Input
 
